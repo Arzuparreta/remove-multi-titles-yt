@@ -6,3 +6,5 @@ playwright-report/
 test-results/
 blob-report/
 playwright/.cache/
+dist-amo/
+web-ext-artifacts/
