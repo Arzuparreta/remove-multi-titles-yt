@@ -19,7 +19,7 @@ To update after pulling changes: open the extension card and hit **Reload**.
 1. Download or clone this repo.
 2. Open `about:debugging`.
 3. Click **This Firefox** (left sidebar).
-4. Under **Temporary Extensions**, click **Load Temporary Add-on…** and choose `manifest.json` in the project folder.
+4. Under **Temporary Extensions**, click **Load Temporary Add-on…** and choose `manifest.json` in the project directory.
 
 Temporary add-ons are removed when Firefox closes; load again if you need it back.
 
