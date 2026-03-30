@@ -8,7 +8,10 @@
  *
  * Compatibility: pin text targets yt-formatted-string when present (keeps heading shape),
  * avoids writing whole-card anchors, scopes list MutationObservers away from the player,
- * and uses webNavigation (background) instead of patching history.
+ * and uses webNavigation (background) instead of patching history. Title text is updated
+ * by mutating text nodes in place (and open shadow subtrees) instead of assigning
+ * textContent on the component, which was destroying internal structure and could break
+ * layout/hit-testing (e.g. sidebar thumbnail clicks).
  */
 
 const STORAGE_PREFIX = "ytTitleLock:";
@@ -18,9 +21,10 @@ const GRID_RESYNC_DEBOUNCE_MS = 800;
 const NAV_APPLY_DEBOUNCE_MS = 64;
 const PLAYER_RETRY_MS = [0, 150, 400, 900];
 
+/** #secondary first so anchor scan cap still covers watch sidebar when #contents is huge. */
 const GRID_OBSERVER_ROOT_SELECTORS = [
-  "#contents",
   "#secondary",
+  "#contents",
   "ytd-miniplayer",
   "ytd-shorts",
 ];
@@ -38,7 +42,7 @@ const GRID_CARD_TAGS = new Set([
   "YTD-PLAYLIST-PANEL-VIDEO-RENDERER",
 ]);
 
-const GRID_SCAN_CAP = 500;
+const GRID_SCAN_CAP = 800;
 
 /**
  * Under #primary-inner only: skip comments/live chat in TreeWalker scans and in the
@@ -166,11 +170,59 @@ function getPinTextTarget(el) {
   return inner || el;
 }
 
+const PIN_TEXT_SKIP_SEL = "script, style, textarea, noscript";
+
+/**
+ * Meaningful text nodes under a root (light DOM + open shadow roots), document order.
+ * Skips script/style; avoids replacing textContent on yt-formatted-string internals.
+ */
+function collectMeaningfulTextNodes(root, maxNodes) {
+  const out = [];
+  function walk(node) {
+    if (out.length >= maxNodes) return;
+    if (node.nodeType === Node.TEXT_NODE) {
+      if (normalizeTitle(node.nodeValue)) out.push(node);
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+    const el = /** @type {Element} */ (node);
+    if (typeof el.matches === "function" && el.matches(PIN_TEXT_SKIP_SEL)) return;
+
+    for (const c of el.childNodes) {
+      walk(c);
+      if (out.length >= maxNodes) return;
+    }
+    const sr = el.shadowRoot;
+    if (sr) {
+      for (const c of sr.childNodes) {
+        walk(c);
+        if (out.length >= maxNodes) return;
+      }
+    }
+  }
+  walk(root);
+  return out;
+}
+
 function setPinnedTitleText(host, pin) {
   const target = getPinTextTarget(host);
   if (!target) return;
   const lock = normalizeTitle(pin);
   if (normalizeTitle(target.textContent) === lock) return;
+
+  const maxNodes = 48;
+  const nodes = collectMeaningfulTextNodes(target, maxNodes);
+  if (nodes.length > 0) {
+    nodes[0].nodeValue = lock;
+    for (let i = 1; i < nodes.length; i++) nodes[i].nodeValue = "";
+    return;
+  }
+
+  if (target.childNodes.length === 0) {
+    target.appendChild(target.ownerDocument.createTextNode(lock));
+    return;
+  }
+
   target.textContent = lock;
 }
 
