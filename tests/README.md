@@ -1,5 +1,7 @@
 # Playwright E2E (extension loaded)
 
+**You do not need Playwright to use the extension** — it is only an automated check for developers. Ignore this folder if you just want YouTube to work.
+
 The browser starts with this repo as an **unpacked Chromium extension** (`manifest.json` in the parent folder).
 
 ## One-time setup

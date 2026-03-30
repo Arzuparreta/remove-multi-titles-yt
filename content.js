@@ -171,13 +171,9 @@ function getLiveVideoId(navDetail) {
 
   if (fromNav) return fromNav;
 
-  // Watch: during SPA transitions, `ytd-player` can still expose the *previous* video-id
-  // while `?v=` already matches the new video — preferring only the player kept the old lock.
-  if (fromUrl && fromPlayer && fromUrl !== fromPlayer) {
-    return fromUrl;
-  }
-  if (fromPlayer) return fromPlayer;
-  return fromUrl;
+  // Watch: same-tab SPA updates the address bar; player / DOM often lag. Use ?v= first.
+  if (fromUrl) return fromUrl;
+  return fromPlayer;
 }
 
 function isElementVisible(el) {
@@ -213,9 +209,15 @@ function findWatchMetadataForVideo(scope, videoId) {
   const all = Array.from(scope.querySelectorAll("ytd-watch-metadata"));
   if (all.length === 0) return null;
 
+  const idMatch = all.filter((m) => m.getAttribute("video-id") === videoId);
+  if (idMatch.length) {
+    const visible = idMatch.filter(isElementVisible);
+    const pool = visible.length ? visible : idMatch;
+    return pool[pool.length - 1];
+  }
+
   const matched = all.filter((m) => metadataMatchesVideo(m, videoId));
   const pool = matched.length ? matched : all;
-
   const visible = pool.filter(isElementVisible);
   const pickFrom = visible.length ? visible : pool;
   return pickFrom[pickFrom.length - 1];
@@ -367,8 +369,23 @@ function tick(sess, key) {
   if (!el) return;
 
   if (sess.lock === null) {
+    const meta = findWatchMetadataForVideo(scope, sess.videoId);
+    if (
+      meta &&
+      meta.getAttribute("video-id") &&
+      meta.getAttribute("video-id") !== sess.videoId
+    ) {
+      return;
+    }
     const t = normalizeTitle(el.textContent);
     if (!t || looksLikeTimestampOrDuration(t)) return;
+    if (t !== sess._capLast) {
+      sess._capLast = t;
+      sess._capN = 1;
+      return;
+    }
+    sess._capN += 1;
+    if (sess._capN < 2) return;
     el.textContent = t;
     sess.lock = t;
     browser.storage.local.set({ [key]: t }).catch(() => {});
@@ -383,12 +400,18 @@ function tick(sess, key) {
 }
 
 async function startSession(videoId) {
+  if (!videoId) return;
+  const key = storageKey(videoId);
+  if (session && session.videoId === videoId) {
+    tick(session, key);
+    return;
+  }
+
   ensureHideStyle();
   cleanupSession();
   setPendingHide(true);
   const gen = sessionGeneration;
 
-  const key = storageKey(videoId);
   const stored = await browser.storage.local.get(key);
   if (gen !== sessionGeneration) return;
 
@@ -402,12 +425,14 @@ async function startSession(videoId) {
     }
   }
 
-  /** @type {{ videoId: string, lock: string | null, observer: MutationObserver | null, rafId: number }} */
+  /** @type {{ videoId: string, lock: string | null, observer: MutationObserver | null, rafId: number, _capLast: string, _capN: number }} */
   const sess = {
     videoId,
     lock,
     observer: null,
     rafId: 0,
+    _capLast: "",
+    _capN: 0,
   };
   session = sess;
 
@@ -596,7 +621,7 @@ function scheduleNavResync() {
     navResyncTimer = 0;
     if (!isWatchOrShortsUrl()) return;
     runRouteSyncFromSources(null);
-  }, 160);
+  }, 280);
 }
 
 function patchHistoryForYouTubeSpa() {
@@ -639,7 +664,6 @@ document.addEventListener(
   "yt-navigate-start",
   () => {
     ensureHideStyle();
-    setPendingHide(true);
   },
   true
 );
@@ -669,4 +693,4 @@ requestAnimationFrame(() =>
 setInterval(() => {
   if (!isWatchOrShortsUrl()) return;
   scheduleNavResync();
-}, 2500);
+}, 4000);
