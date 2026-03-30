@@ -102,6 +102,17 @@ function looksLikeTimestampOrDuration(s) {
   return false;
 }
 
+function isMainYouTubeHost(hostname) {
+  const h = String(hostname || "").replace(/^www\./, "").toLowerCase();
+  return h === "youtube.com" || h === "m.youtube.com" || h === "music.youtube.com";
+}
+
+/** Last-resort ?v= / &v= anywhere in href (search or hash). Not for Shorts paths. */
+function extractVideoIdLooseFromHref(href) {
+  const m = String(href).match(/[?&]v=([a-zA-Z0-9_-]{11})(?:[^a-zA-Z0-9_-]|$)/);
+  return m ? m[1] : null;
+}
+
 function extractVideoId(href) {
   try {
     const u = new URL(href);
@@ -111,6 +122,10 @@ function extractVideoId(href) {
       return m ? m[0] : null;
     }
     if (!host.endsWith("youtube.com")) return null;
+    if (u.pathname.startsWith("/shorts/")) {
+      const m = u.pathname.match(/\/shorts\/([a-zA-Z0-9_-]{11})/);
+      return m ? m[1] : null;
+    }
     if (u.pathname === "/watch" || u.pathname.startsWith("/watch/")) {
       const v = u.searchParams.get("v");
       if (v && YT_ID_RE.test(v)) return v.match(YT_ID_RE)[0];
@@ -119,13 +134,15 @@ function extractVideoId(href) {
       const v = u.searchParams.get("v");
       if (v && YT_ID_RE.test(v)) return v.match(YT_ID_RE)[0];
     }
-    if (u.pathname.startsWith("/shorts/")) {
-      const m = u.pathname.match(/\/shorts\/([a-zA-Z0-9_-]{11})/);
-      return m ? m[1] : null;
-    }
     if (u.pathname.startsWith("/embed/")) {
       const m = u.pathname.match(/\/embed\/([a-zA-Z0-9_-]{11})/);
       return m ? m[1] : null;
+    }
+    if (isMainYouTubeHost(u.hostname)) {
+      const v = u.searchParams.get("v");
+      if (v && YT_ID_RE.test(v)) return v.match(YT_ID_RE)[0];
+      const loose = extractVideoIdLooseFromHref(u.href);
+      if (loose) return loose;
     }
   } catch {
     return null;
@@ -133,13 +150,13 @@ function extractVideoId(href) {
   return null;
 }
 
-/** Standard watch URL ?v= id only (not Shorts). Used as session source of truth when present. */
+/**
+ * Watch id from address bar (not Shorts). Do not require pathname === /watch — some shells
+ * keep other pathnames while ?v= updates; uw was null there → session stuck on first video.
+ */
 function watchUrlVideoId() {
-  const p = location.pathname;
-  if (p.startsWith("/shorts/")) return null;
-  if (p === "/watch" || p.startsWith("/watch/")) return extractVideoId(location.href);
-  if (p === "/" && location.search.includes("v=")) return extractVideoId(location.href);
-  return null;
+  if (location.pathname.startsWith("/shorts/")) return null;
+  return extractVideoId(location.href);
 }
 
 function extractVideoIdFromYtNavigateDetail(detail) {
@@ -664,7 +681,14 @@ async function startSession(videoId) {
   const gen = sessionGeneration;
 
   const stored = await browser.storage.local.get(key);
-  if (gen !== sessionGeneration) return;
+  if (gen !== sessionGeneration) {
+    requestAnimationFrame(() =>
+      requestAnimationFrame(() => {
+        if (isWatchOrShortsUrl()) runRouteSyncFromSources(null);
+      })
+    );
+    return;
+  }
 
   const raw = stored[key];
   let lock = null;
@@ -997,6 +1021,8 @@ try {
     return JSON.stringify(
       {
         href: location.href,
+        pathname: location.pathname,
+        search: location.search,
         watchUrlId: watchUrlVideoId(),
         liveVideoId: getLiveVideoId(null),
         session: session
