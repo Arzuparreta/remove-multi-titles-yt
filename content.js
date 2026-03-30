@@ -570,6 +570,26 @@ function tick(sess, key) {
     ) {
       return;
     }
+    // Watch: do not persist first-seen title until the metadata block is attributed to
+    // this video. Otherwise metadataMatchesVideo() can match via an in-block link while
+    // the visible h1 still shows the *previous* watch — we would save that string under
+    // the new ?v= id and re-apply it forever (looks like "first video title stuck").
+    if (!location.pathname.startsWith("/shorts/")) {
+      const anyAttributed = !!scope.querySelector("ytd-watch-metadata[video-id]");
+      if (anyAttributed) {
+        const va = meta ? meta.getAttribute("video-id") : null;
+        if (!va || va !== sess.videoId) {
+          // #region agent log
+          __ytDbg("H-save", "content.js:tick", "captureBlockedMetaVid", {
+            sessVideoId: sess.videoId,
+            metaVid: va || null,
+            hasMeta: !!meta,
+          });
+          // #endregion
+          return;
+        }
+      }
+    }
     const t = normalizeTitle(el.textContent);
     if (!t || looksLikeTimestampOrDuration(t)) return;
     if (t !== sess._capLast) {
@@ -959,3 +979,41 @@ setInterval(() => {
   if (!isWatchOrShortsUrl()) return;
   scheduleNavResync();
 }, 4000);
+
+/** Paste output from laptop DevTools console while reproducing (empirical debug). */
+try {
+  window.__ytTitleLockDebugDump = function __ytTitleLockDebugDump() {
+    const sc =
+      document.querySelector("#primary-inner") ||
+      document.querySelector("#primary");
+    const metas = sc
+      ? [...sc.querySelectorAll("ytd-watch-metadata")].map((m) => ({
+          videoId: m.getAttribute("video-id"),
+          h1: normalizeTitle(
+            m.querySelector("h1.ytd-watch-metadata")?.textContent || ""
+          ).slice(0, 80),
+        }))
+      : [];
+    return JSON.stringify(
+      {
+        href: location.href,
+        watchUrlId: watchUrlVideoId(),
+        liveVideoId: getLiveVideoId(null),
+        session: session
+          ? {
+              videoId: session.videoId,
+              hasLock: session.lock !== null,
+              lockSample: session.lock
+                ? String(session.lock).slice(0, 120)
+                : null,
+            }
+          : null,
+        metas,
+      },
+      null,
+      2
+    );
+  };
+} catch {
+  /* ignore */
+}
