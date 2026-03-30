@@ -3,11 +3,20 @@
  * (home, search, related, etc.). Depends on lib/browser-polyfill.min.js.
  */
 
-const TITLE_SELECTORS = [
+/** Watch player: never use bare yt-formatted-string.ytd-watch-metadata — first match is often duration. */
+const WATCH_TITLE_SELECTORS = [
+  "ytd-watch-metadata h1.ytd-watch-metadata",
+  "ytd-watch-metadata #title h1",
+  "h1.ytd-watch-metadata",
+  "#title h1",
+];
+
+/** Shorts / odd layouts: try h1 first, then formatted strings with duration filter in findTitleElement. */
+const SHORTS_TITLE_SELECTORS = [
   "h1.ytd-watch-metadata",
   "ytd-watch-metadata h1",
   "#title h1",
-  "yt-formatted-string.ytd-watch-metadata",
+  "h2.ytd-shorts-title",
 ];
 
 const PENDING_CLASS = "yt-title-lock-pending";
@@ -61,6 +70,15 @@ function isValidLockValue(v) {
   return true;
 }
 
+/** YouTube puts duration (e.g. 16:59) in metadata rows that share classes with title fragments — reject as title/lock. */
+function looksLikeTimestampOrDuration(s) {
+  const t = normalizeTitle(s);
+  if (!t) return true;
+  if (/^\d{1,3}:\d{2}:\d{2}$/.test(t)) return true;
+  if (/^\d{1,2}:\d{2}$/.test(t)) return true;
+  return false;
+}
+
 function extractVideoId(href) {
   try {
     const u = new URL(href);
@@ -112,10 +130,10 @@ function getPlayerScopeRoot() {
 
 function ensureHideStyle() {
   if (document.getElementById(STYLE_ID)) return;
-  const watchScoped = TITLE_SELECTORS.map(
+  const watchScoped = WATCH_TITLE_SELECTORS.map(
     (sel) => `html.${PENDING_CLASS} #primary ${sel}`
   ).join(",\n");
-  const shortsScoped = TITLE_SELECTORS.map(
+  const shortsScoped = SHORTS_TITLE_SELECTORS.map(
     (sel) => `html.${PENDING_CLASS} ytd-shorts ${sel}`
   ).join(",\n");
   const style = document.createElement("style");
@@ -130,13 +148,51 @@ function setPendingHide(on) {
 
 function findTitleElement(scope) {
   if (!scope) return null;
-  for (const sel of TITLE_SELECTORS) {
+  const onShorts = location.pathname.startsWith("/shorts/");
+
+  if (!onShorts) {
+    const meta = scope.querySelector("ytd-watch-metadata");
+    if (!meta) return null;
+    const headSelectors = [
+      "h1.ytd-watch-metadata",
+      "#title h1",
+      "h1",
+    ];
+    for (const sel of headSelectors) {
+      const el = meta.querySelector(sel);
+      if (!el) continue;
+      const t = normalizeTitle(el.textContent);
+      if (t && !looksLikeTimestampOrDuration(t)) return el;
+    }
+    const titleRoot = meta.querySelector("#title");
+    if (titleRoot) {
+      for (const fs of titleRoot.querySelectorAll("yt-formatted-string")) {
+        const t = normalizeTitle(fs.textContent);
+        if (t && !looksLikeTimestampOrDuration(t)) return fs;
+      }
+    }
+    return null;
+  }
+
+  for (const sel of SHORTS_TITLE_SELECTORS) {
     const el = scope.querySelector(sel);
     if (!el) continue;
     const t = normalizeTitle(el.textContent);
-    if (t) return el;
+    if (t && !looksLikeTimestampOrDuration(t)) return el;
   }
-  return null;
+  const shortsFormatted = scope.querySelectorAll(
+    "yt-formatted-string.ytd-watch-metadata, yt-formatted-string#shorts-title"
+  );
+  let best = null;
+  let bestLen = 0;
+  for (const el of shortsFormatted) {
+    const t = normalizeTitle(el.textContent);
+    if (t && !looksLikeTimestampOrDuration(t) && t.length > bestLen) {
+      best = el;
+      bestLen = t.length;
+    }
+  }
+  return best;
 }
 
 function findStableParent(scope) {
@@ -173,7 +229,7 @@ function tick(sess, key) {
 
   if (sess.lock === null) {
     const t = normalizeTitle(el.textContent);
-    if (!t) return;
+    if (!t || looksLikeTimestampOrDuration(t)) return;
     el.textContent = t;
     sess.lock = t;
     browser.storage.local.set({ [key]: t }).catch(() => {});
@@ -201,6 +257,10 @@ async function startSession(videoId) {
   let lock = null;
   if (isValidLockValue(raw)) {
     lock = normalizeTitle(typeof raw === "string" ? raw : String(raw));
+    if (looksLikeTimestampOrDuration(lock)) {
+      lock = null;
+      browser.storage.local.remove(key).catch(() => {});
+    }
   }
 
   /** @type {{ videoId: string, lock: string | null, observer: MutationObserver | null, rafId: number }} */
