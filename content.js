@@ -560,19 +560,79 @@ function ensureGridObserver() {
   gridObserver.observe(app, { childList: true, subtree: true });
 }
 
-function scheduleRouteSync(navDetail) {
+function isWatchOrShortsUrl() {
+  const p = location.pathname;
+  return (
+    p.startsWith("/watch") ||
+    p.startsWith("/shorts/") ||
+    (p === "/" && location.search.includes("v="))
+  );
+}
+
+/** Single entry: resolve current video id and start or clear session. */
+function runRouteSyncFromSources(navDetail) {
   ensureGridObserver();
+  const id = getLiveVideoId(navDetail);
+  if (!id) {
+    cleanupSession();
+  } else {
+    startSession(id);
+  }
+  scheduleApplyGridLocks();
+}
+
+function scheduleRouteSync(navDetail) {
   const detail = navDetail;
-  const run = () => {
-    const id = getLiveVideoId(detail);
-    if (!id) {
-      cleanupSession();
-    } else {
-      startSession(id);
-    }
-    scheduleApplyGridLocks();
-  };
+  const run = () => runRouteSyncFromSources(detail);
   requestAnimationFrame(() => requestAnimationFrame(run));
+}
+
+let navResyncTimer = 0;
+
+/** Debounced: catches SPA paths that skip yt-navigate-finish / popstate in a long-lived tab. */
+function scheduleNavResync() {
+  if (navResyncTimer) clearTimeout(navResyncTimer);
+  navResyncTimer = setTimeout(() => {
+    navResyncTimer = 0;
+    if (!isWatchOrShortsUrl()) return;
+    runRouteSyncFromSources(null);
+  }, 160);
+}
+
+function patchHistoryForYouTubeSpa() {
+  if (window.__ytTitleLockHistoryPatched) return;
+  window.__ytTitleLockHistoryPatched = true;
+  const wrap = (name) => {
+    const orig = history[name];
+    if (typeof orig !== "function") return;
+    history[name] = function (...args) {
+      const ret = orig.apply(this, args);
+      scheduleNavResync();
+      return ret;
+    };
+  };
+  wrap("pushState");
+  wrap("replaceState");
+}
+
+function ensureVideoIdNavWatcher() {
+  if (window.__ytTitleLockVidObs) return;
+  const attach = () => {
+    const app = document.querySelector("ytd-app");
+    if (!app) {
+      requestAnimationFrame(attach);
+      return;
+    }
+    const obs = new MutationObserver(() => scheduleNavResync());
+    obs.observe(app, {
+      subtree: true,
+      childList: true,
+      attributes: true,
+      attributeFilter: ["video-id"],
+    });
+    window.__ytTitleLockVidObs = obs;
+  };
+  attach();
 }
 
 document.addEventListener(
@@ -594,12 +654,19 @@ document.addEventListener(
 
 window.addEventListener("popstate", () => scheduleRouteSync(null));
 
+patchHistoryForYouTubeSpa();
+ensureVideoIdNavWatcher();
+
 ensureGridObserver();
 scheduleApplyGridLocks();
 
 requestAnimationFrame(() =>
   requestAnimationFrame(() => {
-    const id = getLiveVideoId(null);
-    if (id) startSession(id);
+    runRouteSyncFromSources(null);
   })
 );
+
+setInterval(() => {
+  if (!isWatchOrShortsUrl()) return;
+  scheduleNavResync();
+}, 2500);
