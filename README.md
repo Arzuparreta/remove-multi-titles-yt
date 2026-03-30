@@ -30,3 +30,10 @@ The first time you open a video, the title you see is saved locally. Next visits
 ---
 
 The extension will be published on the official Chrome Web Store and Firefox Add-ons (AMO) when it is ready; until then, use the steps above.
+
+## Before store submission
+
+- Follow **[STORE_SUBMISSION.md](STORE_SUBMISSION.md)** (ZIP layout, privacy URL, copy-paste text for reviewers).
+- Host **[PRIVACY.md](PRIVACY.md)** at a public URL for both stores.
+- License: **[LICENSE](LICENSE)** (MIT). Third-party: **[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)**.
+- **Icons:** add your PNGs and an `icons` entry in `manifest.json` when the artwork is ready (required for typical store uploads).
