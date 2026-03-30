@@ -13,7 +13,6 @@
 
 const STORAGE_PREFIX = "ytTitleLock:";
 const YT_ID_RE = /[a-zA-Z0-9_-]{11}/;
-const GRID_LINK_SEL = 'a[href*="watch?v="], a[href*="/shorts/"]';
 const GRID_DEBOUNCE_MS = 300;
 const GRID_RESYNC_DEBOUNCE_MS = 800;
 const NAV_APPLY_DEBOUNCE_MS = 64;
@@ -41,12 +40,22 @@ const GRID_CARD_TAGS = new Set([
 
 const GRID_SCAN_CAP = 500;
 
+/**
+ * Under #primary-inner only: skip comments/live chat in TreeWalker scans and in the
+ * subtree observer filter so heavy comment/chat DOM does not schedule grid passes.
+ * Video links inside comments are not rescanned until another list mutation or navigation.
+ */
+const PRIMARY_INNER_IGNORE_SEL =
+  "ytd-comments, #comments, ytd-live-chat-renderer, #chat";
+
 let gridSubtreeObservers = [];
 let gridAppStructureObserver = null;
 let gridResyncTimer = null;
 let gridDebounceTimer = null;
 let gridApplyGen = 0;
 let navApplyTimer = 0;
+/** @type {{ root: Element; filterPrimaryInner: boolean }[] | null} */
+let lastGridLayoutRoots = null;
 
 function storageKey(videoId) {
   return `${STORAGE_PREFIX}${videoId}`;
@@ -284,18 +293,81 @@ function scheduleApplyGridLocks() {
   }, GRID_DEBOUNCE_MS);
 }
 
+function getGridLayoutRoots() {
+  const out = [];
+  for (const sel of GRID_OBSERVER_ROOT_SELECTORS) {
+    document.querySelectorAll(sel).forEach((root) => {
+      if (root.isConnected) out.push({ root, filterPrimaryInner: false });
+    });
+  }
+  const primaryInner = document.querySelector("#primary-inner");
+  if (primaryInner && primaryInner.isConnected) {
+    out.push({ root: primaryInner, filterPrimaryInner: true });
+  }
+  return out;
+}
+
+function gridLayoutRootsMatch(
+  prev,
+  next
+) {
+  if (!prev || !next || prev.length !== next.length) return false;
+  for (let i = 0; i < prev.length; i++) {
+    if (prev[i].filterPrimaryInner !== next[i].filterPrimaryInner) return false;
+    if (prev[i].root !== next[i].root) return false;
+    if (!prev[i].root.isConnected) return false;
+  }
+  return true;
+}
+
+function anchorLooksLikeGridLink(el) {
+  if (!el || el.nodeName !== "A") return false;
+  const href = el.getAttribute("href");
+  if (!href) return false;
+  return href.includes("watch?v=") || href.includes("/shorts/");
+}
+
+/**
+ * First GRID_SCAN_CAP watch/shorts anchors under the same roots as grid observers,
+ * stopping early (no full ytd-app querySelectorAll).
+ */
+function collectFirstGridAnchors(maxCount) {
+  const out = [];
+  outer: for (const { root, filterPrimaryInner } of getGridLayoutRoots()) {
+    if (!root.isConnected) continue;
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, {
+      acceptNode(node) {
+        if (!(node instanceof Element)) return NodeFilter.FILTER_SKIP;
+        if (
+          filterPrimaryInner &&
+          node.matches(PRIMARY_INNER_IGNORE_SEL)
+        ) {
+          return NodeFilter.FILTER_REJECT;
+        }
+        return NodeFilter.FILTER_ACCEPT;
+      },
+    });
+    let n = walker.nextNode();
+    while (n) {
+      if (anchorLooksLikeGridLink(n)) {
+        out.push(n);
+        if (out.length >= maxCount) break outer;
+      }
+      n = walker.nextNode();
+    }
+  }
+  return out;
+}
+
 function gridMutationsTouchListUi(mutations) {
+  const playerSel =
+    "ytd-player, #movie_player, video.html5-main-video, .html5-video-container";
   for (const m of mutations) {
     let t = m.target;
     if (t.nodeType === Node.TEXT_NODE) t = t.parentElement;
     if (!t || typeof t.closest !== "function") continue;
-    if (
-      t.closest(
-        "ytd-player, #movie_player, video.html5-main-video, .html5-video-container"
-      )
-    ) {
-      continue;
-    }
+    if (t.closest(playerSel)) continue;
+    if (t.closest(PRIMARY_INNER_IGNORE_SEL)) continue;
     return true;
   }
   return false;
@@ -333,18 +405,23 @@ function syncGridObservers() {
   const app = document.querySelector("ytd-app");
   if (!app) return;
 
-  disconnectGridSubtreeObservers();
-
-  for (const sel of GRID_OBSERVER_ROOT_SELECTORS) {
-    document.querySelectorAll(sel).forEach((root) => {
-      if (!root.isConnected) return;
-      attachGridSubtreeObserver(root, false);
-    });
+  const layoutRoots = getGridLayoutRoots();
+  if (gridLayoutRootsMatch(lastGridLayoutRoots, layoutRoots)) {
+    if (!gridAppStructureObserver) {
+      gridAppStructureObserver = new MutationObserver(() =>
+        scheduleResyncGridObservers()
+      );
+      gridAppStructureObserver.observe(app, { childList: true, subtree: false });
+    }
+    return;
   }
 
-  const primaryInner = document.querySelector("#primary-inner");
-  if (primaryInner && primaryInner.isConnected) {
-    attachGridSubtreeObserver(primaryInner, true);
+  lastGridLayoutRoots = layoutRoots;
+
+  disconnectGridSubtreeObservers();
+
+  for (const { root, filterPrimaryInner } of layoutRoots) {
+    attachGridSubtreeObserver(root, filterPrimaryInner);
   }
 
   if (!gridAppStructureObserver) {
@@ -355,15 +432,12 @@ function syncGridObservers() {
 
 async function applyGridLocks() {
   const myGen = ++gridApplyGen;
-  const app = document.querySelector("ytd-app");
-  if (!app) return;
+  if (!document.querySelector("ytd-app")) return;
 
-  const anchors = app.querySelectorAll(GRID_LINK_SEL);
+  const anchors = collectFirstGridAnchors(GRID_SCAN_CAP);
   const byCard = new Map();
-  let scanned = 0;
 
   for (const a of anchors) {
-    if (scanned++ > GRID_SCAN_CAP) break;
     if (a.closest("ytd-watch-metadata")) continue;
     const href = a.getAttribute("href");
     if (!href) continue;
