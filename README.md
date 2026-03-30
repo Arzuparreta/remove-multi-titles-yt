@@ -10,7 +10,7 @@ It only runs on youtube.com. It does not touch thumbnails or titles in the home 
 2. Open `chrome://extensions`.
 3. Turn on **Developer mode** (top right).
 4. Click **Load unpacked**.
-5. Pick the folder that contains `manifest.json` (the project root).
+5. Pick the directory that contains `manifest.json` (the cloned repo).
 
 To update after pulling changes: open the extension card and hit **Reload**.
 
@@ -19,7 +19,7 @@ To update after pulling changes: open the extension card and hit **Reload**.
 1. Download or clone this repo.
 2. Open `about:debugging`.
 3. Click **This Firefox** (left sidebar).
-4. Under **Temporary Extensions**, click **Load Temporary Add-on…** and choose `manifest.json` in the project folder.
+4. Under **Temporary Extensions**, click **Load Temporary Add-on…** and choose `manifest.json` in the project directory.
 
 Temporary add-ons are removed when Firefox closes; load again if you need it back.
 
