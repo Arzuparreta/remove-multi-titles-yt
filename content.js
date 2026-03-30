@@ -5,14 +5,26 @@
  * detail or URL), then apply storage ↔ title in a few timed attempts. We do not
  * attach MutationObservers to the title area or hide native text — that fought YouTube
  * and caused stuck / flickering titles.
+ *
+ * Compatibility: pin text targets yt-formatted-string when present (keeps heading shape),
+ * avoids writing whole-card anchors, scopes list MutationObservers away from the player,
+ * and uses webNavigation (background) instead of patching history.
  */
 
 const STORAGE_PREFIX = "ytTitleLock:";
 const YT_ID_RE = /[a-zA-Z0-9_-]{11}/;
 const GRID_LINK_SEL = 'a[href*="watch?v="], a[href*="/shorts/"]';
 const GRID_DEBOUNCE_MS = 300;
+const GRID_RESYNC_DEBOUNCE_MS = 800;
 const NAV_APPLY_DEBOUNCE_MS = 64;
 const PLAYER_RETRY_MS = [0, 150, 400, 900];
+
+const GRID_OBSERVER_ROOT_SELECTORS = [
+  "#contents",
+  "#secondary",
+  "ytd-miniplayer",
+  "ytd-shorts",
+];
 
 const GRID_CARD_TAGS = new Set([
   "YTD-RICH-ITEM-RENDERER",
@@ -29,7 +41,9 @@ const GRID_CARD_TAGS = new Set([
 
 const GRID_SCAN_CAP = 500;
 
-let gridObserver = null;
+let gridSubtreeObservers = [];
+let gridAppStructureObserver = null;
+let gridResyncTimer = null;
 let gridDebounceTimer = null;
 let gridApplyGen = 0;
 let navApplyTimer = 0;
@@ -133,6 +147,24 @@ function cssEsc(id) {
     : id.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
+/** Prefer updating yt-formatted-string so the host heading keeps one component child. */
+function getPinTextTarget(el) {
+  if (!el) return null;
+  if (el.nodeName === "YT-FORMATTED-STRING") return el;
+  const direct = el.querySelector(":scope > yt-formatted-string");
+  if (direct) return direct;
+  const inner = el.querySelector("yt-formatted-string");
+  return inner || el;
+}
+
+function setPinnedTitleText(host, pin) {
+  const target = getPinTextTarget(host);
+  if (!target) return;
+  const lock = normalizeTitle(pin);
+  if (normalizeTitle(target.textContent) === lock) return;
+  target.textContent = lock;
+}
+
 function findWatchTitleElement(videoId) {
   if (!videoId) return null;
   const scope =
@@ -146,7 +178,7 @@ function findWatchTitleElement(videoId) {
   for (const sel of ["h1.ytd-watch-metadata", "#title h1", "h1"]) {
     const el = meta.querySelector(sel);
     if (!el) continue;
-    const t = normalizeTitle(el.textContent);
+    const t = normalizeTitle(getPinTextTarget(el).textContent);
     if (t && !looksLikeTimestampOrDuration(t)) return el;
   }
   return null;
@@ -164,7 +196,7 @@ function findShortsTitleElement() {
   ]) {
     const el = scope.querySelector(sel);
     if (!el) continue;
-    const t = normalizeTitle(el.textContent);
+    const t = normalizeTitle(getPinTextTarget(el).textContent);
     if (t && !looksLikeTimestampOrDuration(t)) return el;
   }
   return null;
@@ -202,11 +234,9 @@ async function applyPlayerTitle(navDetail) {
     if (!el) continue;
 
     if (lock !== null) {
-      if (normalizeTitle(el.textContent) !== lock) {
-        el.textContent = lock;
-      }
+      setPinnedTitleText(el, lock);
     } else {
-      const native = normalizeTitle(el.textContent);
+      const native = normalizeTitle(getPinTextTarget(el).textContent);
       if (native && !looksLikeTimestampOrDuration(native)) {
         try {
           await browser.storage.local.set({ [key]: native });
@@ -242,6 +272,7 @@ function getGridTitleElement(card, link) {
   if (byId) return byId;
   const inner = link.querySelector("yt-formatted-string");
   if (inner) return inner;
+  if (link.querySelector("ytd-thumbnail, img")) return null;
   return link;
 }
 
@@ -251,6 +282,75 @@ function scheduleApplyGridLocks() {
     gridDebounceTimer = null;
     void applyGridLocks();
   }, GRID_DEBOUNCE_MS);
+}
+
+function gridMutationsTouchListUi(mutations) {
+  for (const m of mutations) {
+    let t = m.target;
+    if (t.nodeType === Node.TEXT_NODE) t = t.parentElement;
+    if (!t || typeof t.closest !== "function") continue;
+    if (
+      t.closest(
+        "ytd-player, #movie_player, video.html5-main-video, .html5-video-container"
+      )
+    ) {
+      continue;
+    }
+    return true;
+  }
+  return false;
+}
+
+function disconnectGridSubtreeObservers() {
+  for (const o of gridSubtreeObservers) {
+    try {
+      o.disconnect();
+    } catch {
+      /* ignore */
+    }
+  }
+  gridSubtreeObservers = [];
+}
+
+function attachGridSubtreeObserver(root, filterPlayerSubtree) {
+  const obs = new MutationObserver((mutations) => {
+    if (filterPlayerSubtree && !gridMutationsTouchListUi(mutations)) return;
+    scheduleApplyGridLocks();
+  });
+  obs.observe(root, { childList: true, subtree: true });
+  gridSubtreeObservers.push(obs);
+}
+
+function scheduleResyncGridObservers() {
+  if (gridResyncTimer) clearTimeout(gridResyncTimer);
+  gridResyncTimer = setTimeout(() => {
+    gridResyncTimer = null;
+    syncGridObservers();
+  }, GRID_RESYNC_DEBOUNCE_MS);
+}
+
+function syncGridObservers() {
+  const app = document.querySelector("ytd-app");
+  if (!app) return;
+
+  disconnectGridSubtreeObservers();
+
+  for (const sel of GRID_OBSERVER_ROOT_SELECTORS) {
+    document.querySelectorAll(sel).forEach((root) => {
+      if (!root.isConnected) return;
+      attachGridSubtreeObserver(root, false);
+    });
+  }
+
+  const primaryInner = document.querySelector("#primary-inner");
+  if (primaryInner && primaryInner.isConnected) {
+    attachGridSubtreeObserver(primaryInner, true);
+  }
+
+  if (!gridAppStructureObserver) {
+    gridAppStructureObserver = new MutationObserver(() => scheduleResyncGridObservers());
+    gridAppStructureObserver.observe(app, { childList: true, subtree: false });
+  }
 }
 
 async function applyGridLocks() {
@@ -277,7 +377,7 @@ async function applyGridLocks() {
     const card = closestGridCard(a);
     if (!card || byCard.has(card)) continue;
     const titleEl = getGridTitleElement(card, a);
-    if (!titleEl || !titleEl.textContent) continue;
+    if (!titleEl || !getPinTextTarget(titleEl).textContent) continue;
     byCard.set(card, { id, titleEl });
   }
 
@@ -301,11 +401,11 @@ async function applyGridLocks() {
       pin = normalizeTitle(String(raw));
     }
     if (pin !== null) {
-      if (normalizeTitle(titleEl.textContent) !== pin) {
-        titleEl.textContent = pin;
+      if (normalizeTitle(getPinTextTarget(titleEl).textContent) !== pin) {
+        setPinnedTitleText(titleEl, pin);
       }
     } else {
-      const t = normalizeTitle(titleEl.textContent);
+      const t = normalizeTitle(getPinTextTarget(titleEl).textContent);
       if (t) {
         toSet[k] = t;
         data[k] = t;
@@ -322,34 +422,19 @@ async function applyGridLocks() {
   }
 }
 
-function ensureGridObserver() {
-  if (gridObserver) return;
-  const app = document.querySelector("ytd-app");
-  if (!app) return;
-  gridObserver = new MutationObserver(() => scheduleApplyGridLocks());
-  gridObserver.observe(app, { childList: true, subtree: true });
-}
-
-function patchHistoryForSpa() {
-  if (window.__ytTitleLockHistoryPatched) return;
-  window.__ytTitleLockHistoryPatched = true;
-  for (const name of ["pushState", "replaceState"]) {
-    const orig = history[name];
-    if (typeof orig !== "function") continue;
-    history[name] = function (...args) {
-      const ret = orig.apply(this, args);
-      scheduleApplyPlayerTitle(null);
-      scheduleApplyGridLocks();
-      return ret;
-    };
+browser.runtime.onMessage.addListener((msg) => {
+  if (msg && msg.type === "ytTitleLockHistoryState") {
+    scheduleApplyPlayerTitle(null);
+    scheduleApplyGridLocks();
   }
-}
+});
 
 document.addEventListener(
   "yt-navigate-finish",
   (ev) => {
     scheduleApplyPlayerTitle(ev.detail);
     scheduleApplyGridLocks();
+    syncGridObservers();
   },
   true
 );
@@ -357,14 +442,15 @@ document.addEventListener(
 window.addEventListener("popstate", () => {
   scheduleApplyPlayerTitle(null);
   scheduleApplyGridLocks();
+  syncGridObservers();
 });
 
-patchHistoryForSpa();
-ensureGridObserver();
+syncGridObservers();
 
 requestAnimationFrame(() =>
   requestAnimationFrame(() => {
     scheduleApplyPlayerTitle(null);
     scheduleApplyGridLocks();
+    syncGridObservers();
   })
 );
