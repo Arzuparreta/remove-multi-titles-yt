@@ -4,9 +4,7 @@ Use this when you are ready to publish. **Icons are not in the repo yet**—add 
 
 ## Build the ZIP (do not hand-zip the repo)
 
-The repo includes **`web-ext-config.mjs`** so the store package is reproducible. **`dist-amo/` is gitignored**—the ZIP is a build output, not source.
-
-On any machine with Node 18+:
+**Firefox (AMO)** uses the root `manifest.json` with `background.scripts`. The repo includes **`web-ext-config.mjs`** so the AMO package is reproducible. **`dist-amo/` is gitignored**.
 
 ```bash
 git clone <repo-url> && cd remove-multi-titles-yt
@@ -14,7 +12,9 @@ npm ci
 npm run build:amo
 ```
 
-Upload the file under **`dist-amo/`** to AMO (or Chrome, if you use the same bundle). Alternatively, run the **Build AMO package** workflow on GitHub Actions and download the **`firefox-amo-zip`** artifact.
+Upload the ZIP under **`dist-amo/`** to AMO. Alternatively, run the **Build AMO package** workflow on GitHub Actions and download the **`firefox-amo-zip`** artifact.
+
+**Chrome Web Store** requires `background.service_worker` in the manifest. After `npm ci`, run **`npm run build:chrome-unpacked`**, then zip the **contents** of **`dist/chrome-unpacked/`** (that folder’s `manifest.json` is the Chrome variant). Do not upload the Firefox ZIP to Chrome or vice versa.
 
 Checklist:
 

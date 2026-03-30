@@ -2,7 +2,8 @@
 const { defineConfig, devices } = require("@playwright/test");
 const path = require("path");
 
-const extensionPath = path.resolve(__dirname);
+/** Chrome MV3 bundle (manifest uses service_worker; repo root manifest is Firefox). */
+const extensionPath = path.resolve(__dirname, "dist", "chrome-unpacked");
 
 module.exports = defineConfig({
   testDir: "tests",

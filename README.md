@@ -6,20 +6,20 @@ It only runs on youtube.com. Thumbnails are unchanged; only title text is adjust
 
 ## Install from source (Chrome / Chromium)
 
-1. Download or clone this repo.
-2. Open `chrome://extensions`.
-3. Turn on **Developer mode** (top right).
-4. Click **Load unpacked**.
-5. Pick the directory that contains `manifest.json` (the cloned repo).
+Chrome Manifest V3 only allows a **service worker** background. Firefox (and `web-ext` builds for AMO) use **`background.scripts`**, which Chrome rejects—so this repo keeps **Firefox** `manifest.json` at the project root and generates a Chrome bundle.
 
-To update after pulling changes: open the extension card and hit **Reload**.
+1. Download or clone this repo and run `npm ci` (or at least `npm run build:chrome-unpacked`).
+2. Open `chrome://extensions`, enable **Developer mode**, **Load unpacked**.
+3. Select **`dist/chrome-unpacked`** (created by `npm run build:chrome-unpacked`), not the repo root.
+
+To update after pulling changes: run `npm run build:chrome-unpacked` again, then **Reload** the extension in Chrome.
 
 ## Install from source (Firefox)
 
 1. Download or clone this repo.
 2. Open `about:debugging`.
 3. Click **This Firefox** (left sidebar).
-4. Under **Temporary Extensions**, click **Load Temporary Add-on…** and choose `manifest.json` in the project directory.
+4. Under **Temporary Extensions**, click **Load Temporary Add-on…** and choose **`manifest.json`** in the project directory (Firefox expects `background.scripts`, not `service_worker`, in that file).
 
 Temporary add-ons are removed when Firefox closes; load again if you need it back.
 

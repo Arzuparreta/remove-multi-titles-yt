@@ -8,7 +8,7 @@
   "permissions": ["storage", "webNavigation"],
   "host_permissions": ["*://*.youtube.com/*"],
   "background": {
-    "service_worker": "background.js"
+    "scripts": ["background.js"]
   },
   "content_scripts": [
     {

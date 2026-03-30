@@ -8,4 +8,5 @@ test-results/
 blob-report/
 playwright/.cache/
 dist-amo/
+dist/chrome-unpacked/
 web-ext-artifacts/

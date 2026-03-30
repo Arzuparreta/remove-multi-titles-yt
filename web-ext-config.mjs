@@ -22,6 +22,7 @@ export default {
     "test-results/**",
     "blob-report/**",
     "dist-amo/**",
+    "dist/**",
     "web-ext-artifacts/**",
     ".cursor/**",
   ],
