@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "Remove Multi Titles (YouTube)",
+  "version": "1.0.0",
+  "description": "Pins the first-seen title per video on YouTube Watch and Shorts to reduce A/B title flicker.",
+  "permissions": ["storage"],
+  "host_permissions": ["*://*.youtube.com/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://*.youtube.com/*"],
+      "js": ["lib/browser-polyfill.min.js", "content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "remove-multi-titles-yt@local",
+      "strict_min_version": "109.0"
+    }
+  }
+}
