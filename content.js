@@ -1,32 +1,19 @@
 /**
- * Pins first-seen titles per YouTube video on the player (watch/shorts) and on grid cards
- * (home, search, related, etc.). Depends on lib/browser-polyfill.min.js.
+ * Pins first-seen titles per YouTube video (watch, Shorts, grid cards).
+ *
+ * Approach: after each navigation we read the official video id (yt-navigate-finish
+ * detail or URL), then apply storage ↔ title in a few timed attempts. We do not
+ * attach MutationObservers to the title area or hide native text — that fought YouTube
+ * and caused stuck / flickering titles.
  */
 
-/** Watch player: never use bare yt-formatted-string.ytd-watch-metadata — first match is often duration. */
-const WATCH_TITLE_SELECTORS = [
-  "ytd-watch-metadata h1.ytd-watch-metadata",
-  "ytd-watch-metadata #title h1",
-  "h1.ytd-watch-metadata",
-  "#title h1",
-];
-
-/** Shorts / odd layouts: try h1 first, then formatted strings with duration filter in findTitleElement. */
-const SHORTS_TITLE_SELECTORS = [
-  "h1.ytd-watch-metadata",
-  "ytd-watch-metadata h1",
-  "#title h1",
-  "h2.ytd-shorts-title",
-];
-
-const PENDING_CLASS = "yt-title-lock-pending";
-const STYLE_ID = "yt-title-lock-style";
 const STORAGE_PREFIX = "ytTitleLock:";
-const PARENT_WAIT_MS = 15000;
-
 const YT_ID_RE = /[a-zA-Z0-9_-]{11}/;
-
 const GRID_LINK_SEL = 'a[href*="watch?v="], a[href*="/shorts/"]';
+const GRID_DEBOUNCE_MS = 300;
+const NAV_APPLY_DEBOUNCE_MS = 64;
+const PLAYER_RETRY_MS = [0, 150, 400, 900];
+
 const GRID_CARD_TAGS = new Set([
   "YTD-RICH-ITEM-RENDERER",
   "YTD-VIDEO-RENDERER",
@@ -41,41 +28,11 @@ const GRID_CARD_TAGS = new Set([
 ]);
 
 const GRID_SCAN_CAP = 500;
-const GRID_DEBOUNCE_MS = 250;
-
-// #region agent log
-let __ytDbgRouteTs = 0;
-let __ytDbgDisagreeLogTs = 0;
-let __ytDbgStaleMetaTs = 0;
-let __ytDbgApplyKeyTs = {};
-function __ytDbg(hypothesisId, location, message, data) {
-  const now = Date.now();
-  const body = {
-    location,
-    message,
-    data,
-    timestamp: now,
-    hypothesisId,
-    runId: "debug-pre",
-  };
-  browser.runtime.sendMessage({ __ytTitleLockDbg: true, body }).catch(() => {});
-}
-// #endregion
-
-/** Last target video id from yt-navigate-* (used when ?v= and DOM disagree during SPA). */
-let lastYtNavTargetVideoId = null;
-let lastYtNavTargetTs = 0;
-
-/** Last ?v= seen from history.pushState/replaceState or popstate (location can lag the arg URL). */
-let lastHistoryWatchUrlId = null;
-
-/** @type {{ videoId: string, lock: string | null, observer: MutationObserver | null, rafId: number } | null} */
-let session = null;
-let sessionGeneration = 0;
 
 let gridObserver = null;
 let gridDebounceTimer = null;
 let gridApplyGen = 0;
+let navApplyTimer = 0;
 
 function storageKey(videoId) {
   return `${STORAGE_PREFIX}${videoId}`;
@@ -91,29 +48,16 @@ function isValidLockValue(v) {
   if (v === undefined || v === null) return false;
   const s = typeof v === "string" ? v : String(v);
   const t = normalizeTitle(s);
-  if (!t) return false;
-  if (t === "undefined") return false;
+  if (!t || t === "undefined") return false;
   return true;
 }
 
-/** YouTube puts duration (e.g. 16:59) in metadata rows that share classes with title fragments — reject as title/lock. */
 function looksLikeTimestampOrDuration(s) {
   const t = normalizeTitle(s);
   if (!t) return true;
   if (/^\d{1,3}:\d{2}:\d{2}$/.test(t)) return true;
   if (/^\d{1,2}:\d{2}$/.test(t)) return true;
   return false;
-}
-
-function isMainYouTubeHost(hostname) {
-  const h = String(hostname || "").replace(/^www\./, "").toLowerCase();
-  return h === "youtube.com" || h === "m.youtube.com" || h === "music.youtube.com";
-}
-
-/** Last-resort ?v= / &v= anywhere in href (search or hash). Not for Shorts paths. */
-function extractVideoIdLooseFromHref(href) {
-  const m = String(href).match(/[?&]v=([a-zA-Z0-9_-]{11})(?:[^a-zA-Z0-9_-]|$)/);
-  return m ? m[1] : null;
 }
 
 function extractVideoId(href) {
@@ -129,11 +73,12 @@ function extractVideoId(href) {
       const m = u.pathname.match(/\/shorts\/([a-zA-Z0-9_-]{11})/);
       return m ? m[1] : null;
     }
-    if (u.pathname === "/watch" || u.pathname.startsWith("/watch/")) {
-      const v = u.searchParams.get("v");
-      if (v && YT_ID_RE.test(v)) return v.match(YT_ID_RE)[0];
-    }
-    if (u.pathname === "/" || u.pathname === "") {
+    if (
+      u.pathname === "/watch" ||
+      u.pathname.startsWith("/watch/") ||
+      u.pathname === "/" ||
+      u.pathname === ""
+    ) {
       const v = u.searchParams.get("v");
       if (v && YT_ID_RE.test(v)) return v.match(YT_ID_RE)[0];
     }
@@ -141,45 +86,10 @@ function extractVideoId(href) {
       const m = u.pathname.match(/\/embed\/([a-zA-Z0-9_-]{11})/);
       return m ? m[1] : null;
     }
-    if (isMainYouTubeHost(u.hostname)) {
-      const v = u.searchParams.get("v");
-      if (v && YT_ID_RE.test(v)) return v.match(YT_ID_RE)[0];
-      const loose = extractVideoIdLooseFromHref(u.href);
-      if (loose) return loose;
-    }
+    const v2 = u.searchParams.get("v");
+    if (v2 && YT_ID_RE.test(v2)) return v2.match(YT_ID_RE)[0];
   } catch {
     return null;
-  }
-  return null;
-}
-
-function watchPageShellPresent() {
-  // Do not use #primary-inner alone — it exists on home/feed and would keep a stale lastHistory id.
-  return !!document.querySelector("ytd-watch-flexy");
-}
-
-function recordWatchUrlIdFromLocation() {
-  if (location.pathname.startsWith("/shorts/")) return;
-  const id = extractVideoId(location.href);
-  if (id) lastHistoryWatchUrlId = id;
-}
-
-/**
- * Watch id from address bar (not Shorts). Fallback: canonical link, then last history URL
- * (pushState arg can carry ?v= before location.href updates). Last fallback only if watch
- * shell is present so feed/home does not reuse a stale id.
- */
-function watchUrlVideoId() {
-  if (location.pathname.startsWith("/shorts/")) return null;
-  const fromBar = extractVideoId(location.href);
-  if (fromBar) return fromBar;
-  const canon = document.querySelector('link[rel="canonical"]');
-  if (canon?.href) {
-    const c = extractVideoId(canon.href);
-    if (c) return c;
-  }
-  if (watchPageShellPresent() && lastHistoryWatchUrlId) {
-    return lastHistoryWatchUrlId;
   }
   return null;
 }
@@ -206,596 +116,116 @@ function extractVideoIdFromYtNavigateDetail(detail) {
   return null;
 }
 
-/**
- * What is actually loaded in the watch column (player / metadata). Prefer this over
- * location.href — the URL can lag SPA swaps, so the extension would keep the first video's
- * lock and overwrite the h1 for every subsequent watch.
- */
-function getWatchFlexyVideoIdInScope(scope) {
-  if (!scope || typeof scope.querySelector !== "function") return null;
-  const flexy = scope.querySelector("ytd-watch-flexy");
-  if (!flexy) return null;
-  const m = flexy.getAttribute("video-id")?.match(YT_ID_RE);
-  return m ? m[0] : null;
-}
-
-function getLivePlayerVideoId() {
-  const scope =
-    document.querySelector("#primary-inner") ||
-    document.querySelector("#primary") ||
-    document.querySelector("ytd-watch-flexy");
-  if (!scope) return null;
-
-  const players = Array.from(
-    scope.querySelectorAll("ytd-player#ytd-player, ytd-player")
-  );
-  for (let i = players.length - 1; i >= 0; i--) {
-    const raw = players[i].getAttribute("video-id");
-    const m = raw?.match(YT_ID_RE);
-    if (m) return m[0];
-  }
-
-  const metas = Array.from(scope.querySelectorAll("ytd-watch-metadata[video-id]"));
-  for (let i = metas.length - 1; i >= 0; i--) {
-    const raw = metas[i].getAttribute("video-id");
-    const m = raw?.match(YT_ID_RE);
-    if (m) return m[0];
-  }
-
-  const fromFlexy = getWatchFlexyVideoIdInScope(scope);
-  if (fromFlexy) return fromFlexy;
-
-  return null;
-}
-
-function recordYtNavigateTarget(detail) {
-  const id = extractVideoIdFromYtNavigateDetail(detail);
-  if (id) {
-    lastYtNavTargetVideoId = id;
-    lastYtNavTargetTs = Date.now();
-  }
-}
-
-/** Single source of truth for "which video is this page showing?" */
-function getLiveVideoId(navDetail) {
+/** Prefer YouTube’s navigate payload; else URL (watch ?v= or Shorts path). */
+function currentPlayerVideoId(navDetail) {
   const fromNav = extractVideoIdFromYtNavigateDetail(navDetail);
-  const scope =
-    document.querySelector("#primary-inner") ||
-    document.querySelector("#primary") ||
-    document.querySelector("ytd-watch-flexy");
-  const fromFlexy = scope ? getWatchFlexyVideoIdInScope(scope) : null;
-  const fromPlayer = getLivePlayerVideoId();
-  const fromUrl = extractVideoId(location.href);
-
-  if (location.pathname.startsWith("/shorts/")) {
-    return fromNav || fromUrl || fromPlayer;
-  }
-
   if (fromNav) return fromNav;
-
-  const age = Date.now() - lastYtNavTargetTs;
-  const fresh =
-    lastYtNavTargetVideoId && age >= 0 && age < 12000;
-
-  // tick() always passes navDetail=null; yt target id still helps for many ticks after SPA.
-  const trio = [fromUrl, fromPlayer, fromFlexy].filter(Boolean);
-  const trioSet = new Set(trio);
-  if (trioSet.size > 1 && fresh) {
-    if (lastYtNavTargetVideoId === fromUrl) return fromUrl;
-    if (lastYtNavTargetVideoId === fromPlayer) return fromPlayer;
-    if (lastYtNavTargetVideoId === fromFlexy) return fromFlexy;
+  if (location.pathname.startsWith("/shorts/")) {
+    const m = location.pathname.match(/\/shorts\/([a-zA-Z0-9_-]{11})/);
+    return m ? m[1] : null;
   }
-
-  // Watch: ?v= and primary-inner metadata/player/flexy can update in different orders.
-  if (fromUrl && fromPlayer && fromUrl !== fromPlayer) {
-    let picked = fromUrl;
-    if (fresh) {
-      if (lastYtNavTargetVideoId === fromPlayer) picked = fromPlayer;
-      else if (lastYtNavTargetVideoId === fromUrl) picked = fromUrl;
-      else if (lastYtNavTargetVideoId === fromFlexy) picked = fromFlexy;
-    }
-    // #region agent log
-    const __now = Date.now();
-    if (__now - __ytDbgDisagreeLogTs > 350) {
-      __ytDbgDisagreeLogTs = __now;
-      __ytDbg("H-A", "content.js:getLiveVideoId", "idDisagree", {
-        fromUrl,
-        fromPlayer,
-        fromFlexy,
-        lastYtNavTargetVideoId,
-        navAgeMs: age,
-        picked,
-      });
-    }
-    // #endregion
-    return picked;
-  }
-
-  if (fromUrl && fromFlexy && fromUrl !== fromFlexy) {
-    let picked = fromUrl;
-    if (fresh) {
-      if (lastYtNavTargetVideoId === fromFlexy) picked = fromFlexy;
-      else if (lastYtNavTargetVideoId === fromUrl) picked = fromUrl;
-    }
-    // #region agent log
-    const __n = Date.now();
-    if (__n - __ytDbgDisagreeLogTs > 350) {
-      __ytDbgDisagreeLogTs = __n;
-      __ytDbg("H-A", "content.js:getLiveVideoId", "idDisagreeUrlFlexy", {
-        fromUrl,
-        fromFlexy,
-        fromPlayer,
-        lastYtNavTargetVideoId,
-        navAgeMs: age,
-        picked,
-      });
-    }
-    // #endregion
-    return picked;
-  }
-
-  if (fromUrl) return fromUrl;
-  return fromPlayer;
+  return extractVideoId(location.href);
 }
 
-function isElementVisible(el) {
-  if (!el) return false;
-  if (el.hidden) return false;
-  const st = getComputedStyle(el);
-  if (st.display === "none" || st.visibility === "hidden") return false;
-  return el.offsetParent !== null || st.position === "fixed";
+function cssEsc(id) {
+  return typeof CSS !== "undefined" && typeof CSS.escape === "function"
+    ? CSS.escape(id)
+    : id.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
-function metadataMatchesVideo(meta, videoId) {
-  const vid = meta.getAttribute("video-id");
-  if (vid === videoId) return true;
-  for (const a of meta.querySelectorAll("a[href]")) {
-    try {
-      const id = extractVideoId(
-        new URL(a.getAttribute("href") || "", location.origin).href
-      );
-      if (id === videoId) return true;
-    } catch {
-      continue;
-    }
-  }
-  return false;
-}
-
-/**
- * After SPA navigation YouTube can leave multiple ytd-watch-metadata nodes in #primary.
- * Always pick the block for this video, or the last visible one (newest mount).
- */
-function findWatchMetadataForVideo(scope, videoId) {
-  if (!scope || !videoId) return null;
-  const all = Array.from(scope.querySelectorAll("ytd-watch-metadata"));
-  if (all.length === 0) return null;
-
-  const idMatch = all.filter((m) => m.getAttribute("video-id") === videoId);
-  if (idMatch.length) {
-    const visible = idMatch.filter(isElementVisible);
-    const pool = visible.length ? visible : idMatch;
-    return pool[pool.length - 1];
-  }
-
-  // No block claims this id yet. If another block still has a different video-id, do not
-  // fall back to "last visible" among all — that is often the previous watch's metadata
-  // (wrong h1 under the player until the new block gets video-id).
-  const hasOtherAttributed = all.some((m) => {
-    const v = m.getAttribute("video-id");
-    return !!v && v !== videoId;
-  });
-  if (hasOtherAttributed) {
-    // #region agent log
-    const __t = Date.now();
-    if (__t - __ytDbgStaleMetaTs > 400) {
-      __ytDbgStaleMetaTs = __t;
-      __ytDbg("H-multi", "content.js:findWatchMetadataForVideo", "skipStaleBlock", {
-        videoId,
-        attributedIds: [
-          ...new Set(
-            all.map((m) => m.getAttribute("video-id")).filter(Boolean)
-          ),
-        ],
-      });
-    }
-    // #endregion
-    return null;
-  }
-
-  const matched = all.filter((m) => metadataMatchesVideo(m, videoId));
-  const pool = matched.length ? matched : all;
-  const visible = pool.filter(isElementVisible);
-  const pickFrom = visible.length ? visible : pool;
-  return pickFrom[pickFrom.length - 1];
-}
-
-function findStableParentForWatchMeta(meta, scope) {
-  if (!meta) return null;
-  const fold = meta.closest("#above-the-fold");
-  if (fold && scope.contains(fold)) return fold;
-  const flexy = meta.closest("ytd-watch-flexy");
-  if (flexy && scope.contains(flexy)) return flexy;
-  return meta;
-}
-
-function findShortsStableParent(scope, videoId) {
+function findWatchTitleElement(videoId) {
+  if (!videoId) return null;
+  const scope =
+    document.querySelector("#primary-inner") || document.querySelector("#primary");
   if (!scope) return null;
-  const byAttr = scope.querySelector(
-    `ytd-reel-video-renderer[video-id="${videoId}"]`
+  const metas = scope.querySelectorAll(
+    `ytd-watch-metadata[video-id="${cssEsc(videoId)}"]`
   );
-  if (byAttr) return byAttr;
-  const reels = Array.from(scope.querySelectorAll("ytd-reel-video-renderer"));
-  for (const r of reels) {
-    if (metadataMatchesVideo(r, videoId)) return r;
-  }
-  const vis = reels.filter(isElementVisible);
-  if (vis.length) return vis[vis.length - 1];
-  return scope.querySelector("ytd-shorts") || scope;
-}
-
-/**
- * Scope player title queries to the active watch/shorts column so document.querySelector
- * does not hit a cached/hidden metadata node from a previous SPA navigation (bug: wrong title stuck).
- */
-function getPlayerScopeRoot() {
-  const path = location.pathname;
-  if (path.startsWith("/shorts/")) {
-    return (
-      document.querySelector("ytd-shorts") ||
-      document.querySelector("#shorts-container") ||
-      document.querySelector("#primary-inner") ||
-      document.querySelector("#primary") ||
-      document.body
-    );
-  }
-  return (
-    document.querySelector("#primary-inner") ||
-    document.querySelector("#primary") ||
-    document.querySelector("ytd-watch-flexy")
-  );
-}
-
-function ensureHideStyle() {
-  if (document.getElementById(STYLE_ID)) return;
-  const watchScoped = WATCH_TITLE_SELECTORS.map(
-    (sel) => `html.${PENDING_CLASS} #primary ${sel}`
-  ).join(",\n");
-  const shortsScoped = SHORTS_TITLE_SELECTORS.map(
-    (sel) => `html.${PENDING_CLASS} ytd-shorts ${sel}`
-  ).join(",\n");
-  const style = document.createElement("style");
-  style.id = STYLE_ID;
-  style.textContent = `${watchScoped},\n${shortsScoped} { visibility: hidden !important; }`;
-  (document.head || document.documentElement).appendChild(style);
-}
-
-function setPendingHide(on) {
-  document.documentElement.classList.toggle(PENDING_CLASS, on);
-}
-
-function findTitleInWatchMetadata(meta) {
+  const meta = metas.length ? metas[metas.length - 1] : null;
   if (!meta) return null;
-  const headSelectors = [
-    "h1.ytd-watch-metadata",
-    "#title h1",
-    "h1",
-  ];
-  for (const sel of headSelectors) {
+  for (const sel of ["h1.ytd-watch-metadata", "#title h1", "h1"]) {
     const el = meta.querySelector(sel);
     if (!el) continue;
     const t = normalizeTitle(el.textContent);
     if (t && !looksLikeTimestampOrDuration(t)) return el;
   }
-  const titleRoot = meta.querySelector("#title");
-  if (titleRoot) {
-    for (const fs of titleRoot.querySelectorAll("yt-formatted-string")) {
-      const t = normalizeTitle(fs.textContent);
-      if (t && !looksLikeTimestampOrDuration(t)) return fs;
-    }
-  }
   return null;
 }
 
-/**
- * All watch title nodes for this video-id (YouTube can leave duplicates during SPA).
- * Prefer these when applying a lock so we do not fight one stale h1 while another stays wrong.
- */
-function findAllWatchTitleElementsForVideo(scope, videoId) {
-  if (!scope || !videoId) return [];
-  if (location.pathname.startsWith("/shorts/")) {
-    const one = findTitleElement(scope, videoId);
-    return one ? [one] : [];
-  }
-  const esc =
-    typeof CSS !== "undefined" && typeof CSS.escape === "function"
-      ? CSS.escape(videoId)
-      : videoId;
-  const metas = scope.querySelectorAll(
-    `ytd-watch-metadata[video-id="${esc}"]`
-  );
-  const out = [];
-  for (const meta of metas) {
-    const el = findTitleInWatchMetadata(meta);
-    if (el) out.push(el);
-  }
-  return out;
-}
-
-function findTitleElement(scope, videoId) {
-  if (!scope || !videoId) return null;
-  const onShorts = location.pathname.startsWith("/shorts/");
-
-  if (!onShorts) {
-    const meta = findWatchMetadataForVideo(scope, videoId);
-    return findTitleInWatchMetadata(meta);
-  }
-
-  const reel = findShortsStableParent(scope, videoId);
-  const reelScope = reel || scope;
-  for (const sel of SHORTS_TITLE_SELECTORS) {
-    const el = reelScope.querySelector(sel);
+function findShortsTitleElement() {
+  const scope =
+    document.querySelector("ytd-shorts") ||
+    document.querySelector("#shorts-container") ||
+    document.body;
+  for (const sel of [
+    "h1.ytd-watch-metadata",
+    "h2.ytd-shorts-title",
+    "#title h1",
+  ]) {
+    const el = scope.querySelector(sel);
     if (!el) continue;
     const t = normalizeTitle(el.textContent);
     if (t && !looksLikeTimestampOrDuration(t)) return el;
   }
-  const shortsFormatted = reelScope.querySelectorAll(
-    "yt-formatted-string.ytd-watch-metadata, yt-formatted-string#shorts-title"
-  );
-  let best = null;
-  let bestLen = 0;
-  for (const el of shortsFormatted) {
-    const t = normalizeTitle(el.textContent);
-    if (t && !looksLikeTimestampOrDuration(t) && t.length > bestLen) {
-      best = el;
-      bestLen = t.length;
+  return null;
+}
+
+async function applyPlayerTitle(navDetail) {
+  const videoId = currentPlayerVideoId(navDetail);
+  if (!videoId) return;
+
+  const onShorts = location.pathname.startsWith("/shorts/");
+  const key = storageKey(videoId);
+  let lock = null;
+  try {
+    const stored = await browser.storage.local.get(key);
+    const raw = stored[key];
+    if (isValidLockValue(raw)) {
+      lock = normalizeTitle(String(raw));
+      if (looksLikeTimestampOrDuration(lock)) lock = null;
     }
-  }
-  return best;
-}
-
-function cleanupSession() {
-  sessionGeneration += 1;
-  if (session) {
-    if (session.observer) session.observer.disconnect();
-    if (session.rafId) cancelAnimationFrame(session.rafId);
-  }
-  session = null;
-  setPendingHide(false);
-}
-
-/**
- * @param {{ videoId: string, lock: string | null, observer: MutationObserver | null, rafId: number }} sess
- * @param {string} key
- */
-function tick(sess, key) {
-  if (sess !== session) return;
-  const uw = watchUrlVideoId();
-  const liveId = getLiveVideoId(null);
-
-  // Watch: ?v= updates before player/metadata in long-lived tabs. If we only compared
-  // getLiveVideoId() to the session, both could stay on the first video while the address
-  // bar already shows the next — lock never rotates (first title forever).
-  if (uw && uw !== sess.videoId) {
-    // #region agent log
-    __ytDbg("H-C", "content.js:tick", "watchUrlVsSession", {
-      sessVideoId: sess.videoId,
-      watchUrlId: uw,
-      liveId,
-    });
-    // #endregion
-    startSession(uw);
+  } catch {
     return;
   }
 
-  if ((!uw || location.pathname.startsWith("/shorts/")) && liveId && liveId !== sess.videoId) {
-    // #region agent log
-    __ytDbg("H-C", "content.js:tick", "liveIdVsSession", {
-      sessVideoId: sess.videoId,
-      liveId,
-    });
-    // #endregion
-    startSession(liveId);
-    return;
-  }
-  const scope = getPlayerScopeRoot();
-  if (!scope) return;
+  const pickEl = () =>
+    onShorts ? findShortsTitleElement() : findWatchTitleElement(videoId);
 
-  if (sess.lock === null) {
-    const el = findTitleElement(scope, sess.videoId);
-    if (!el) return;
-    const meta = findWatchMetadataForVideo(scope, sess.videoId);
-    if (
-      meta &&
-      meta.getAttribute("video-id") &&
-      meta.getAttribute("video-id") !== sess.videoId
-    ) {
-      return;
+  let cumulative = 0;
+  for (let i = 0; i < PLAYER_RETRY_MS.length; i++) {
+    const wait = PLAYER_RETRY_MS[i] - cumulative;
+    cumulative = PLAYER_RETRY_MS[i];
+    if (wait > 0) {
+      await new Promise((r) => setTimeout(r, wait));
     }
-    // Watch: do not persist first-seen title until the metadata block is attributed to
-    // this video. Otherwise metadataMatchesVideo() can match via an in-block link while
-    // the visible h1 still shows the *previous* watch — we would save that string under
-    // the new ?v= id and re-apply it forever (looks like "first video title stuck").
-    if (!location.pathname.startsWith("/shorts/")) {
-      const anyAttributed = !!scope.querySelector("ytd-watch-metadata[video-id]");
-      if (anyAttributed) {
-        const va = meta ? meta.getAttribute("video-id") : null;
-        if (!va || va !== sess.videoId) {
-          // #region agent log
-          __ytDbg("H-save", "content.js:tick", "captureBlockedMetaVid", {
-            sessVideoId: sess.videoId,
-            metaVid: va || null,
-            hasMeta: !!meta,
-          });
-          // #endregion
-          return;
+    const el = pickEl();
+    if (!el) continue;
+
+    if (lock !== null) {
+      if (normalizeTitle(el.textContent) !== lock) {
+        el.textContent = lock;
+      }
+    } else {
+      const native = normalizeTitle(el.textContent);
+      if (native && !looksLikeTimestampOrDuration(native)) {
+        try {
+          await browser.storage.local.set({ [key]: native });
+        } catch {
+          /* ignore */
         }
       }
     }
-    const t = normalizeTitle(el.textContent);
-    if (!t || looksLikeTimestampOrDuration(t)) return;
-    if (t !== sess._capLast) {
-      sess._capLast = t;
-      sess._capN = 1;
-      return;
-    }
-    sess._capN += 1;
-    if (sess._capN < 2) return;
-    el.textContent = t;
-    sess.lock = t;
-    browser.storage.local.set({ [key]: t }).catch(() => {});
-    setPendingHide(false);
     return;
   }
-
-  let titleEls = findAllWatchTitleElementsForVideo(scope, sess.videoId);
-  if (titleEls.length === 0) {
-    const one = findTitleElement(scope, sess.videoId);
-    titleEls = one ? [one] : [];
-  }
-  if (titleEls.length === 0) return;
-
-  let anyDiff = false;
-  for (const tel of titleEls) {
-    if (normalizeTitle(tel.textContent) !== sess.lock) {
-      anyDiff = true;
-      break;
-    }
-  }
-  if (anyDiff) {
-    // #region agent log
-    const ak = `${sess.videoId}:${sess.lock?.slice(0, 20)}`;
-    const t0 = __ytDbgApplyKeyTs[ak] || 0;
-    if (Date.now() - t0 > 700) {
-      __ytDbgApplyKeyTs[ak] = Date.now();
-      const meta = findWatchMetadataForVideo(scope, sess.videoId);
-      __ytDbg("H-B,H-E", "content.js:tick", "applyLockToTitleEl", {
-        sessVideoId: sess.videoId,
-        liveId,
-        nTitleEls: titleEls.length,
-        metaVideoId: meta ? meta.getAttribute("video-id") : null,
-        h1Before: normalizeTitle(titleEls[0].textContent).slice(0, 100),
-        lockSample: String(sess.lock || "").slice(0, 100),
-      });
-    }
-    // #endregion
-    for (const tel of titleEls) {
-      if (normalizeTitle(tel.textContent) !== sess.lock) {
-        tel.textContent = sess.lock;
-      }
-    }
-  }
-  setPendingHide(false);
 }
 
-async function startSession(videoId) {
-  if (!videoId) return;
-  const key = storageKey(videoId);
-  if (session && session.videoId === videoId) {
-    tick(session, key);
-    return;
-  }
-
-  // #region agent log
-  const prevVideoId = session?.videoId ?? null;
-  // #endregion
-
-  ensureHideStyle();
-  cleanupSession();
-  setPendingHide(true);
-  const gen = sessionGeneration;
-
-  const stored = await browser.storage.local.get(key);
-  if (gen !== sessionGeneration) {
-    requestAnimationFrame(() =>
-      requestAnimationFrame(() => {
-        if (isWatchOrShortsUrl()) runRouteSyncFromSources(null);
-      })
-    );
-    return;
-  }
-
-  const raw = stored[key];
-  let lock = null;
-  if (isValidLockValue(raw)) {
-    lock = normalizeTitle(typeof raw === "string" ? raw : String(raw));
-    if (looksLikeTimestampOrDuration(lock)) {
-      lock = null;
-      browser.storage.local.remove(key).catch(() => {});
-    }
-  }
-
-  /** @type {{ videoId: string, lock: string | null, observer: MutationObserver | null, rafId: number, _capLast: string, _capN: number }} */
-  const sess = {
-    videoId,
-    lock,
-    observer: null,
-    rafId: 0,
-    _capLast: "",
-    _capN: 0,
-  };
-  session = sess;
-
-  // #region agent log
-  __ytDbg("H-D", "content.js:startSession", "newSession", {
-    videoId,
-    prevVideoId,
-    hasLock: lock !== null,
-    lockSample: lock ? String(lock).slice(0, 100) : null,
-  });
-  // #endregion
-
-  const deadline = Date.now() + PARENT_WAIT_MS;
-
-  function attachObserver(parent) {
-    if (sess !== session) return;
-    if (sess.observer) sess.observer.disconnect();
-    sess.observer = new MutationObserver(() => {
-      tick(sess, key);
-    });
-    sess.observer.observe(parent, {
-      childList: true,
-      subtree: true,
-      characterData: true,
-    });
-  }
-
-  function frame() {
-    if (sess !== session) return;
-    const scope = getPlayerScopeRoot();
-    if (!scope || !sess.videoId) {
-      if (Date.now() >= deadline) {
-        setPendingHide(false);
-        sess.rafId = 0;
-        return;
-      }
-      sess.rafId = requestAnimationFrame(frame);
-      return;
-    }
-
-    let parent = null;
-    if (location.pathname.startsWith("/shorts/")) {
-      parent = findShortsStableParent(scope, sess.videoId);
-    } else {
-      const meta = findWatchMetadataForVideo(scope, sess.videoId);
-      parent = findStableParentForWatchMeta(meta, scope);
-    }
-
-    if (parent) {
-      attachObserver(parent);
-      tick(sess, key);
-      sess.rafId = 0;
-      return;
-    }
-    if (Date.now() >= deadline) {
-      setPendingHide(false);
-      sess.rafId = 0;
-      return;
-    }
-    sess.rafId = requestAnimationFrame(frame);
-  }
-
-  frame();
+function scheduleApplyPlayerTitle(navDetail) {
+  if (navApplyTimer) clearTimeout(navApplyTimer);
+  const d = navDetail;
+  navApplyTimer = setTimeout(() => {
+    navApplyTimer = 0;
+    void applyPlayerTitle(d);
+  }, NAV_APPLY_DEBOUNCE_MS);
 }
 
 function closestGridCard(el) {
@@ -829,7 +259,6 @@ async function applyGridLocks() {
   if (!app) return;
 
   const anchors = app.querySelectorAll(GRID_LINK_SEL);
-  /** @type {Map<Element, { id: string, titleEl: Element }>} */
   const byCard = new Map();
   let scanned = 0;
 
@@ -846,8 +275,7 @@ async function applyGridLocks() {
     }
     if (!id) continue;
     const card = closestGridCard(a);
-    if (!card) continue;
-    if (byCard.has(card)) continue;
+    if (!card || byCard.has(card)) continue;
     const titleEl = getGridTitleElement(card, a);
     if (!titleEl || !titleEl.textContent) continue;
     byCard.set(card, { id, titleEl });
@@ -856,33 +284,41 @@ async function applyGridLocks() {
   if (byCard.size === 0) return;
 
   const keys = [...new Set([...byCard.values()].map((e) => storageKey(e.id)))];
-  const data = await browser.storage.local.get(keys);
+  let data;
+  try {
+    data = await browser.storage.local.get(keys);
+  } catch {
+    return;
+  }
   if (myGen !== gridApplyGen) return;
 
   const toSet = {};
-
   for (const { id, titleEl } of byCard.values()) {
-    const key = storageKey(id);
-    const raw = data[key];
-    let lock = null;
+    const k = storageKey(id);
+    const raw = data[k];
+    let pin = null;
     if (isValidLockValue(raw)) {
-      lock = normalizeTitle(String(raw));
+      pin = normalizeTitle(String(raw));
     }
-    if (lock !== null) {
-      if (normalizeTitle(titleEl.textContent) !== lock) {
-        titleEl.textContent = lock;
+    if (pin !== null) {
+      if (normalizeTitle(titleEl.textContent) !== pin) {
+        titleEl.textContent = pin;
       }
     } else {
       const t = normalizeTitle(titleEl.textContent);
       if (t) {
-        toSet[key] = t;
-        data[key] = t;
+        toSet[k] = t;
+        data[k] = t;
       }
     }
   }
 
   if (Object.keys(toSet).length > 0) {
-    await browser.storage.local.set(toSet);
+    try {
+      await browser.storage.local.set(toSet);
+    } catch {
+      /* ignore */
+    }
   }
 }
 
@@ -894,193 +330,41 @@ function ensureGridObserver() {
   gridObserver.observe(app, { childList: true, subtree: true });
 }
 
-function isWatchOrShortsUrl() {
-  if (location.pathname.startsWith("/shorts/")) return true;
-  return watchUrlVideoId() !== null;
-}
-
-/** Single entry: resolve current video id and start or clear session. */
-function runRouteSyncFromSources(navDetail) {
-  ensureGridObserver();
-  const uw = watchUrlVideoId();
-  const id = uw || getLiveVideoId(navDetail);
-  // #region agent log
-  const now = Date.now();
-  if (now - __ytDbgRouteTs > 450) {
-    __ytDbgRouteTs = now;
-    const fromUrl = extractVideoId(location.href);
-    const fromPlayer = getLivePlayerVideoId();
-    const fromNav = extractVideoIdFromYtNavigateDetail(navDetail);
-    const rsScope =
-      document.querySelector("#primary-inner") ||
-      document.querySelector("#primary");
-    const fromFlexy = rsScope ? getWatchFlexyVideoIdInScope(rsScope) : null;
-    __ytDbg("H-A,H-C", "content.js:runRouteSync", "routeSync", {
-      chosen: id,
-      watchUrlVideoId: uw,
-      fromUrl,
-      fromPlayer,
-      fromFlexy,
-      fromNav,
-      path: location.pathname + location.search.slice(0, 80),
-    });
-  }
-  // #endregion
-  if (!id) {
-    lastHistoryWatchUrlId = null;
-    cleanupSession();
-  } else {
-    startSession(id);
-  }
-  scheduleApplyGridLocks();
-}
-
-function scheduleRouteSync(navDetail) {
-  const detail = navDetail;
-  const run = () => runRouteSyncFromSources(detail);
-  requestAnimationFrame(() => requestAnimationFrame(run));
-}
-
-let navResyncTimer = 0;
-
-/** Debounced: catches SPA paths that skip yt-navigate-finish / popstate in a long-lived tab. */
-function scheduleNavResync() {
-  if (navResyncTimer) clearTimeout(navResyncTimer);
-  navResyncTimer = setTimeout(() => {
-    navResyncTimer = 0;
-    if (!isWatchOrShortsUrl()) return;
-    runRouteSyncFromSources(null);
-  }, 280);
-}
-
-function patchHistoryForYouTubeSpa() {
+function patchHistoryForSpa() {
   if (window.__ytTitleLockHistoryPatched) return;
   window.__ytTitleLockHistoryPatched = true;
-  const wrap = (name) => {
+  for (const name of ["pushState", "replaceState"]) {
     const orig = history[name];
-    if (typeof orig !== "function") return;
+    if (typeof orig !== "function") continue;
     history[name] = function (...args) {
       const ret = orig.apply(this, args);
-      try {
-        if (args.length >= 3 && typeof args[2] === "string") {
-          const abs = new URL(args[2], location.origin).href;
-          const hid = extractVideoId(abs);
-          if (hid) lastHistoryWatchUrlId = hid;
-        } else {
-          recordWatchUrlIdFromLocation();
-        }
-      } catch {
-        /* ignore */
-      }
-      scheduleNavResync();
+      scheduleApplyPlayerTitle(null);
+      scheduleApplyGridLocks();
       return ret;
     };
-  };
-  wrap("pushState");
-  wrap("replaceState");
+  }
 }
-
-function ensureVideoIdNavWatcher() {
-  if (window.__ytTitleLockVidObs) return;
-  const attach = () => {
-    const app = document.querySelector("ytd-app");
-    if (!app) {
-      requestAnimationFrame(attach);
-      return;
-    }
-    const obs = new MutationObserver(() => scheduleNavResync());
-    obs.observe(app, {
-      subtree: true,
-      childList: true,
-      attributes: true,
-      attributeFilter: ["video-id"],
-    });
-    window.__ytTitleLockVidObs = obs;
-  };
-  attach();
-}
-
-document.addEventListener(
-  "yt-navigate-start",
-  (ev) => {
-    ensureHideStyle();
-    recordYtNavigateTarget(ev.detail);
-  },
-  true
-);
 
 document.addEventListener(
   "yt-navigate-finish",
   (ev) => {
-    recordYtNavigateTarget(ev.detail);
-    scheduleRouteSync(ev.detail);
+    scheduleApplyPlayerTitle(ev.detail);
+    scheduleApplyGridLocks();
   },
   true
 );
 
 window.addEventListener("popstate", () => {
-  recordWatchUrlIdFromLocation();
-  scheduleRouteSync(null);
+  scheduleApplyPlayerTitle(null);
+  scheduleApplyGridLocks();
 });
 
-patchHistoryForYouTubeSpa();
-ensureVideoIdNavWatcher();
-
+patchHistoryForSpa();
 ensureGridObserver();
-scheduleApplyGridLocks();
 
 requestAnimationFrame(() =>
   requestAnimationFrame(() => {
-    runRouteSyncFromSources(null);
+    scheduleApplyPlayerTitle(null);
+    scheduleApplyGridLocks();
   })
 );
-
-setInterval(() => {
-  if (!isWatchOrShortsUrl()) return;
-  scheduleNavResync();
-}, 4000);
-
-/** Paste output from laptop DevTools console while reproducing (empirical debug). */
-try {
-  window.__ytTitleLockDebugDump = function __ytTitleLockDebugDump() {
-    const sc =
-      document.querySelector("#primary-inner") ||
-      document.querySelector("#primary");
-    const metas = sc
-      ? [...sc.querySelectorAll("ytd-watch-metadata")].map((m) => ({
-          videoId: m.getAttribute("video-id"),
-          h1: normalizeTitle(
-            m.querySelector("h1.ytd-watch-metadata")?.textContent || ""
-          ).slice(0, 80),
-        }))
-      : [];
-    const canonEl = document.querySelector('link[rel="canonical"]');
-    return JSON.stringify(
-      {
-        href: location.href,
-        pathname: location.pathname,
-        search: location.search,
-        canonicalHref: canonEl?.href || null,
-        canonicalVideoId: canonEl?.href ? extractVideoId(canonEl.href) : null,
-        lastHistoryWatchUrlId,
-        watchShell: watchPageShellPresent(),
-        watchUrlId: watchUrlVideoId(),
-        liveVideoId: getLiveVideoId(null),
-        session: session
-          ? {
-              videoId: session.videoId,
-              hasLock: session.lock !== null,
-              lockSample: session.lock
-                ? String(session.lock).slice(0, 120)
-                : null,
-            }
-          : null,
-        metas,
-      },
-      null,
-      2
-    );
-  };
-} catch {
-  /* ignore */
-}
