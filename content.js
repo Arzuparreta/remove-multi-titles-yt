@@ -12,33 +12,13 @@
  * by mutating text nodes in place (and open shadow subtrees) instead of assigning
  * textContent on the component, which was destroying internal structure and could break
  * layout/hit-testing (e.g. sidebar thumbnail clicks).
- */
-
-/**
- * Bisect “sidebar thumbnail click does nothing”: set **at most one** property to `true`,
- * reload the extension, retest. All `false` = shipping behaviour.
  *
- * How to read results (thumbnail opens video = “fixed”):
- * | Flag | If this alone fixes it, suspect |
- * |------|----------------------------------|
- * | skipApplyGridLocks | Whole grid pipeline (DOM writes, storage batch, and/or when it runs). |
- * | skipGridTitleDomWrites | Title DOM mutation (`setPinnedTitleText`), not storage/scan/observer. |
- * | skipGridSubtreeObservers | MutationObservers re-firing `applyGridLocks` (timing/re-entrancy), not one-shot apply. |
- * | skipPlayerTitle | Watch/Shorts **main** title pass affecting shared layout or navigation. |
- * | skipHistoryStateMessage | Extra applies from `webNavigation` background pings racing SPA updates. |
- * | skipInitialBootstrapSchedules | Only the first double-rAF + sync on load (before/without yt-navigate-finish). |
- *
- * Not covered here (discard manually): load without `lib/browser-polyfill.min.js`; disable
- * the background script permission; another extension; Firefox vs Chrome.
+ * We do not attach subtree MutationObservers to #secondary: the recommendations column
+ * mutates constantly (hover, lazy-load, our title pins). Each batch schedules
+ * applyGridLocks and can race YouTube’s SPA handler on thumbnail clicks — the UI
+ * shows active state but navigation never completes. Sidebar tiles are still scanned
+ * whenever grid locks run (navigation, #contents mutations, etc.).
  */
-const DEBUG_DISCARD = {
-  skipApplyGridLocks: false,
-  skipGridTitleDomWrites: false,
-  skipGridSubtreeObservers: false,
-  skipPlayerTitle: false,
-  skipHistoryStateMessage: false,
-  skipInitialBootstrapSchedules: false,
-};
 
 const STORAGE_PREFIX = "ytTitleLock:";
 const YT_ID_RE = /[a-zA-Z0-9_-]{11}/;
@@ -47,8 +27,15 @@ const GRID_RESYNC_DEBOUNCE_MS = 800;
 const NAV_APPLY_DEBOUNCE_MS = 64;
 const PLAYER_RETRY_MS = [0, 150, 400, 900];
 
-/** #secondary first so anchor scan cap still covers watch sidebar when #contents is huge. */
+/** Subtree observers: exclude #secondary (see file comment). */
 const GRID_OBSERVER_ROOT_SELECTORS = [
+  "#contents",
+  "ytd-miniplayer",
+  "ytd-shorts",
+];
+
+/** Anchor scan roots: #secondary first so cap still covers watch sidebar when #contents is huge. */
+const GRID_SCAN_ROOT_SELECTORS = [
   "#secondary",
   "#contents",
   "ytd-miniplayer",
@@ -290,7 +277,6 @@ function findShortsTitleElement() {
 }
 
 async function applyPlayerTitle(navDetail) {
-  if (DEBUG_DISCARD.skipPlayerTitle) return;
   const videoId = currentPlayerVideoId(navDetail);
   if (!videoId) return;
 
@@ -372,17 +358,34 @@ function scheduleApplyGridLocks() {
   }, GRID_DEBOUNCE_MS);
 }
 
-function getGridLayoutRoots() {
+function appendPrimaryInnerRoot(out) {
+  const primaryInner = document.querySelector("#primary-inner");
+  if (primaryInner && primaryInner.isConnected) {
+    out.push({ root: primaryInner, filterPrimaryInner: true });
+  }
+}
+
+/** Roots watched by MutationObservers (no #secondary). */
+function getGridObserverRoots() {
   const out = [];
   for (const sel of GRID_OBSERVER_ROOT_SELECTORS) {
     document.querySelectorAll(sel).forEach((root) => {
       if (root.isConnected) out.push({ root, filterPrimaryInner: false });
     });
   }
-  const primaryInner = document.querySelector("#primary-inner");
-  if (primaryInner && primaryInner.isConnected) {
-    out.push({ root: primaryInner, filterPrimaryInner: true });
+  appendPrimaryInnerRoot(out);
+  return out;
+}
+
+/** Roots walked for anchor collection (includes #secondary). */
+function getGridScanRoots() {
+  const out = [];
+  for (const sel of GRID_SCAN_ROOT_SELECTORS) {
+    document.querySelectorAll(sel).forEach((root) => {
+      if (root.isConnected) out.push({ root, filterPrimaryInner: false });
+    });
   }
+  appendPrimaryInnerRoot(out);
   return out;
 }
 
@@ -407,12 +410,12 @@ function anchorLooksLikeGridLink(el) {
 }
 
 /**
- * First GRID_SCAN_CAP watch/shorts anchors under the same roots as grid observers,
+ * First GRID_SCAN_CAP watch/shorts anchors under scan roots (includes #secondary),
  * stopping early (no full ytd-app querySelectorAll).
  */
 function collectFirstGridAnchors(maxCount) {
   const out = [];
-  outer: for (const { root, filterPrimaryInner } of getGridLayoutRoots()) {
+  outer: for (const { root, filterPrimaryInner } of getGridScanRoots()) {
     if (!root.isConnected) continue;
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, {
       acceptNode(node) {
@@ -484,7 +487,7 @@ function syncGridObservers() {
   const app = document.querySelector("ytd-app");
   if (!app) return;
 
-  const layoutRoots = getGridLayoutRoots();
+  const layoutRoots = getGridObserverRoots();
   if (gridLayoutRootsMatch(lastGridLayoutRoots, layoutRoots)) {
     if (!gridAppStructureObserver) {
       gridAppStructureObserver = new MutationObserver(() =>
@@ -500,9 +503,7 @@ function syncGridObservers() {
   disconnectGridSubtreeObservers();
 
   for (const { root, filterPrimaryInner } of layoutRoots) {
-    if (!DEBUG_DISCARD.skipGridSubtreeObservers) {
-      attachGridSubtreeObserver(root, filterPrimaryInner);
-    }
+    attachGridSubtreeObserver(root, filterPrimaryInner);
   }
 
   if (!gridAppStructureObserver) {
@@ -512,7 +513,6 @@ function syncGridObservers() {
 }
 
 async function applyGridLocks() {
-  if (DEBUG_DISCARD.skipApplyGridLocks) return;
   const myGen = ++gridApplyGen;
   if (!document.querySelector("ytd-app")) return;
 
@@ -557,10 +557,7 @@ async function applyGridLocks() {
       pin = normalizeTitle(String(raw));
     }
     if (pin !== null) {
-      if (
-        !DEBUG_DISCARD.skipGridTitleDomWrites &&
-        normalizeTitle(getPinTextTarget(titleEl).textContent) !== pin
-      ) {
+      if (normalizeTitle(getPinTextTarget(titleEl).textContent) !== pin) {
         setPinnedTitleText(titleEl, pin);
       }
     } else {
@@ -583,7 +580,6 @@ async function applyGridLocks() {
 
 browser.runtime.onMessage.addListener((msg) => {
   if (msg && msg.type === "ytTitleLockHistoryState") {
-    if (DEBUG_DISCARD.skipHistoryStateMessage) return;
     scheduleApplyPlayerTitle(null);
     scheduleApplyGridLocks();
   }
@@ -609,10 +605,8 @@ syncGridObservers();
 
 requestAnimationFrame(() =>
   requestAnimationFrame(() => {
-    if (!DEBUG_DISCARD.skipInitialBootstrapSchedules) {
-      scheduleApplyPlayerTitle(null);
-      scheduleApplyGridLocks();
-      syncGridObservers();
-    }
+    scheduleApplyPlayerTitle(null);
+    scheduleApplyGridLocks();
+    syncGridObservers();
   })
 );

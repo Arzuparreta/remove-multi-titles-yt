@@ -32,7 +32,7 @@ The first time you see a title for a video (watch page, Shorts, or a grid tile),
 | Area | Behaviour |
 |------|-----------|
 | Watch / Shorts | Apply pin or save first-seen **once per navigation**, with bounded retries (`PLAYER_RETRY_MS`), not a live DOM fight. |
-| Lists / grids | Debounced `MutationObserver` on `ytd-app` only for tile titles (separate from the watch title pipeline). |
+| Lists / grids | Debounced subtree observers on `#contents`, miniplayer, Shorts, and `#primary-inner` (not `#secondary`) so sidebar churn does not constantly re-run pin passes. Sidebar tiles are still included when locks run (navigation, history message, other roots). |
 | Video id | YouTube `yt-navigate-finish` detail when present; otherwise URL (`?v=` / Shorts path). |
 
 ## E2E tests (Playwright)

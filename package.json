@@ -12,7 +12,8 @@
     "test:e2e:headed": "playwright test",
     "pretest:e2e:ci": "npm run build:chrome-unpacked",
     "test:e2e:ci": "xvfb-run -a playwright test",
-    "test:e2e:ui": "playwright test --ui"
+    "test:e2e:ui": "playwright test --ui",
+    "test:debug:sidebar": "sh scripts/run-sidebar-debug.sh"
   },
   "devDependencies": {
     "@playwright/test": "^1.49.1",

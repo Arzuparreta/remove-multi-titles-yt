@@ -20,3 +20,9 @@ npm run test:e2e
 ```
 
 No `DISPLAY`: install Xvfb (e.g. `sudo pacman -S xorg-server-xvfb`) or use `npm run test:e2e:ci`.
+
+## Sidebar thumbnail A/B (extension vs none)
+
+`npm run test:debug:sidebar` runs the same navigation test twice: **with-extension** and **no-extension**. It picks a **visible** sidebar watch link (skips title links and hidden promos such as `yt-video-attribute-view-model`), scrolls it into view, clicks, and expects `?v=` to change. The current page’s `v` is used to exclude the active video (YouTube may redirect away from the entry URL).
+
+In CI/Xvfb, both projects have been observed to pass, so a human-only bug may need **headed** runs, **prefilled `chrome.storage` pins**, or a different rec row. If **no-extension** passes and **with-extension** fails on your machine, the regression is extension-specific.
