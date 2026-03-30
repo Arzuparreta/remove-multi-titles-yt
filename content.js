@@ -46,6 +46,7 @@ const GRID_DEBOUNCE_MS = 250;
 // #region agent log
 let __ytDbgRouteTs = 0;
 let __ytDbgDisagreeLogTs = 0;
+let __ytDbgStaleMetaTs = 0;
 let __ytDbgApplyKeyTs = {};
 function __ytDbg(hypothesisId, location, message, data) {
   const now = Date.now();
@@ -270,6 +271,31 @@ function findWatchMetadataForVideo(scope, videoId) {
     const visible = idMatch.filter(isElementVisible);
     const pool = visible.length ? visible : idMatch;
     return pool[pool.length - 1];
+  }
+
+  // No block claims this id yet. If another block still has a different video-id, do not
+  // fall back to "last visible" among all — that is often the previous watch's metadata
+  // (wrong h1 under the player until the new block gets video-id).
+  const hasOtherAttributed = all.some((m) => {
+    const v = m.getAttribute("video-id");
+    return !!v && v !== videoId;
+  });
+  if (hasOtherAttributed) {
+    // #region agent log
+    const __t = Date.now();
+    if (__t - __ytDbgStaleMetaTs > 400) {
+      __ytDbgStaleMetaTs = __t;
+      __ytDbg("H-multi", "content.js:findWatchMetadataForVideo", "skipStaleBlock", {
+        videoId,
+        attributedIds: [
+          ...new Set(
+            all.map((m) => m.getAttribute("video-id")).filter(Boolean)
+          ),
+        ],
+      });
+    }
+    // #endregion
+    return null;
   }
 
   const matched = all.filter((m) => metadataMatchesVideo(m, videoId));

@@ -196,4 +196,88 @@ test.describe("watch title after SPA-style navigation", () => {
       titleA
     );
   });
+
+  test("diagnostic: poll inner metas during SPA for multiple video-id", async ({
+    page,
+  }) => {
+    test.setTimeout(120_000);
+
+    await page.goto(VIDEO_A, { waitUntil: "domcontentloaded" });
+    await page.locator(titleHeading).first().waitFor({ state: "visible" });
+    await page.waitForTimeout(2500);
+
+    const clickedId = await page.evaluate((excludeId) => {
+      const sel =
+        "#secondary a[href*='/watch?v='], ytd-watch-next-secondary-results-renderer a[href*='/watch?v=']";
+      const links = Array.from(document.querySelectorAll(sel));
+      for (const a of links) {
+        const href = a.getAttribute("href") || "";
+        if (href.includes(excludeId)) continue;
+        try {
+          const u = new URL(href, location.origin);
+          const v = u.searchParams.get("v");
+          if (v && /^[a-zA-Z0-9_-]{11}$/.test(v)) {
+            a.click();
+            return v;
+          }
+        } catch {
+          continue;
+        }
+      }
+      return null;
+    }, "jNQXAC9IVRw");
+
+    if (!clickedId) {
+      test.skip(true, "No secondary watch link other than video A (layout or locale)");
+    }
+
+    const snapshots = [];
+    for (let i = 0; i < 28; i++) {
+      await page.waitForTimeout(150);
+      const d = await dumpWatchDebug(page);
+      const distinctIds = [
+        ...new Set(
+          d.metasInner.map((m) => m.videoId || "").filter(Boolean)
+        ),
+      ];
+      const row = {
+        step: i,
+        nMeta: d.metasInner.length,
+        distinctIds,
+        vFromUrl: d.vFromUrl,
+        h1Previews: d.metasInner.map((m) =>
+          (m.h1 || "").slice(0, 48)
+        ),
+      };
+      snapshots.push(row);
+      if (d.metasInner.length > 1 || distinctIds.length > 1) {
+        appendDebug({
+          hypothesisId: "H-multi",
+          location: "tests/title-persistence.spec.js",
+          message: "multiMetaDuringSpa",
+          data: row,
+        });
+      }
+    }
+
+    appendDebug({
+      hypothesisId: "H-multi",
+      location: "tests/title-persistence.spec.js",
+      message: "multiMetaScanSummary",
+      data: {
+        clickedId,
+        maxMetas: Math.max(...snapshots.map((s) => s.nMeta), 0),
+        maxDistinct: Math.max(...snapshots.map((s) => s.distinctIds.length), 0),
+        lastSnapshot: snapshots[snapshots.length - 1],
+      },
+    });
+
+    await page.waitForURL(
+      (url) => url.searchParams.get("v") === clickedId,
+      { timeout: 90_000 }
+    );
+
+    const titleEnd = (await page.locator(titleHeading).first().innerText()).trim();
+    expect(titleEnd.length).toBeGreaterThan(0);
+  });
 });
