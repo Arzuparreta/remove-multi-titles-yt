@@ -10,7 +10,7 @@ It only runs on youtube.com. It does not touch thumbnails or titles in the home 
 2. Open `chrome://extensions`.
 3. Turn on **Developer mode** (top right).
 4. Click **Load unpacked**.
-5. Pick the folder that contains `manifest.json` (the project root).
+5. Pick the directory that contains `manifest.json` (the cloned repo).
 
 To update after pulling changes: open the extension card and hit **Reload**.
 
