@@ -50,6 +50,25 @@ Without a display (SSH/CI), use `npm run test:e2e:ci` or install Xvfb and use `s
 
 The extension will be published on the official Chrome Web Store and Firefox Add-ons (AMO) when it is ready; until then, use the steps above.
 
+## Build the Firefox / AMO upload ZIP (any computer)
+
+The upload file is **not stored in git** on purpose: it is generated from the tracked source so every machine (and every tag) gets a clean package.
+
+**On your machine**
+
+```bash
+git clone https://github.com/Arzuparreta/remove-multi-titles-yt.git
+cd remove-multi-titles-yt
+npm ci
+npm run build:amo
+```
+
+The ZIP appears under **`dist-amo/`** (name includes the version from `manifest.json`, e.g. `remove_multi_titles_youtube_-2.0.0.zip`). Upload that file to [addons.mozilla.org](https://addons.mozilla.org/developers/).
+
+**Without installing anything locally**
+
+After this workflow is on the default branch: open the repo on GitHub → **Actions** → **Build AMO package** → **Run workflow**. When the run finishes, download the **`firefox-amo-zip`** artifact from the run page.
+
 ## Before store submission
 
 - Follow **[STORE_SUBMISSION.md](STORE_SUBMISSION.md)** (ZIP layout, privacy URL, copy-paste text for reviewers).

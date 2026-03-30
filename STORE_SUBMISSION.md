@@ -2,11 +2,25 @@
 
 Use this when you are ready to publish. **Icons are not in the repo yet**—add PNGs and an `icons` block in `manifest.json` before final upload if the store requires package icons (Chrome typically does).
 
-## Before you zip the extension
+## Build the ZIP (do not hand-zip the repo)
 
-- [ ] Add icon files (e.g. `icons/icon16.png`, `icon32.png`, `icon48.png`, `icon128.png`) and add an `icons` key to `manifest.json`.
+The repo includes **`web-ext-config.mjs`** so the store package is reproducible. **`dist-amo/` is gitignored**—the ZIP is a build output, not source.
+
+On any machine with Node 18+:
+
+```bash
+git clone <repo-url> && cd remove-multi-titles-yt
+npm ci
+npm run build:amo
+```
+
+Upload the file under **`dist-amo/`** to AMO (or Chrome, if you use the same bundle). Alternatively, run the **Build AMO package** workflow on GitHub Actions and download the **`firefox-amo-zip`** artifact.
+
+Checklist:
+
+- [ ] Add icon files (e.g. `icons/icon16.png`, …) and an `icons` key in `manifest.json` if the store requires them.
 - [ ] Bump `version` in `manifest.json` when you ship an update.
-- [ ] **Do not** include `.git` inside the ZIP. Include: `manifest.json`, `content.js`, `background.js`, `lib/`, `LICENSE`, `THIRD_PARTY_NOTICES.md` (and optionally `PRIVACY.md` for your records—the stores need a **hosted URL**, not only the file in the zip).
+- [ ] Run `npm run build:amo` (or the GitHub Action)—do not zip the whole project folder; that would include junk and can fail validation.
 
 ## Public privacy policy URL
 
@@ -52,7 +66,7 @@ This package includes **minified** third-party code: `lib/browser-polyfill.min.j
 
 ## Firefox Add-ons extras
 
-- You will sign the package (Mozilla’s flow or web-ext). Temporary add-on loading is only for development.
+- Mozilla signs listed add-ons after upload. Local `web-ext build` only creates the unsigned ZIP for submission. Temporary add-on loading is only for development.
 
 ## Project links
 
