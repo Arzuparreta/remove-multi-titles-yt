@@ -115,6 +115,10 @@ function extractVideoId(href) {
       const v = u.searchParams.get("v");
       if (v && YT_ID_RE.test(v)) return v.match(YT_ID_RE)[0];
     }
+    if (u.pathname === "/" || u.pathname === "") {
+      const v = u.searchParams.get("v");
+      if (v && YT_ID_RE.test(v)) return v.match(YT_ID_RE)[0];
+    }
     if (u.pathname.startsWith("/shorts/")) {
       const m = u.pathname.match(/\/shorts\/([a-zA-Z0-9_-]{11})/);
       return m ? m[1] : null;
@@ -126,6 +130,15 @@ function extractVideoId(href) {
   } catch {
     return null;
   }
+  return null;
+}
+
+/** Standard watch URL ?v= id only (not Shorts). Used as session source of truth when present. */
+function watchUrlVideoId() {
+  const p = location.pathname;
+  if (p.startsWith("/shorts/")) return null;
+  if (p === "/watch" || p.startsWith("/watch/")) return extractVideoId(location.href);
+  if (p === "/" && location.search.includes("v=")) return extractVideoId(location.href);
   return null;
 }
 
@@ -515,8 +528,25 @@ function cleanupSession() {
  */
 function tick(sess, key) {
   if (sess !== session) return;
+  const uw = watchUrlVideoId();
   const liveId = getLiveVideoId(null);
-  if (liveId && liveId !== sess.videoId) {
+
+  // Watch: ?v= updates before player/metadata in long-lived tabs. If we only compared
+  // getLiveVideoId() to the session, both could stay on the first video while the address
+  // bar already shows the next — lock never rotates (first title forever).
+  if (uw && uw !== sess.videoId) {
+    // #region agent log
+    __ytDbg("H-C", "content.js:tick", "watchUrlVsSession", {
+      sessVideoId: sess.videoId,
+      watchUrlId: uw,
+      liveId,
+    });
+    // #endregion
+    startSession(uw);
+    return;
+  }
+
+  if ((!uw || location.pathname.startsWith("/shorts/")) && liveId && liveId !== sess.videoId) {
     // #region agent log
     __ytDbg("H-C", "content.js:tick", "liveIdVsSession", {
       sessVideoId: sess.videoId,
@@ -807,7 +837,8 @@ function isWatchOrShortsUrl() {
 /** Single entry: resolve current video id and start or clear session. */
 function runRouteSyncFromSources(navDetail) {
   ensureGridObserver();
-  const id = getLiveVideoId(navDetail);
+  const uw = watchUrlVideoId();
+  const id = uw || getLiveVideoId(navDetail);
   // #region agent log
   const now = Date.now();
   if (now - __ytDbgRouteTs > 450) {
@@ -821,6 +852,7 @@ function runRouteSyncFromSources(navDetail) {
     const fromFlexy = rsScope ? getWatchFlexyVideoIdInScope(rsScope) : null;
     __ytDbg("H-A,H-C", "content.js:runRouteSync", "routeSync", {
       chosen: id,
+      watchUrlVideoId: uw,
       fromUrl,
       fromPlayer,
       fromFlexy,
