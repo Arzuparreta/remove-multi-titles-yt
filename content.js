@@ -392,6 +392,31 @@ function findTitleInWatchMetadata(meta) {
   return null;
 }
 
+/**
+ * All watch title nodes for this video-id (YouTube can leave duplicates during SPA).
+ * Prefer these when applying a lock so we do not fight one stale h1 while another stays wrong.
+ */
+function findAllWatchTitleElementsForVideo(scope, videoId) {
+  if (!scope || !videoId) return [];
+  if (location.pathname.startsWith("/shorts/")) {
+    const one = findTitleElement(scope, videoId);
+    return one ? [one] : [];
+  }
+  const esc =
+    typeof CSS !== "undefined" && typeof CSS.escape === "function"
+      ? CSS.escape(videoId)
+      : videoId;
+  const metas = scope.querySelectorAll(
+    `ytd-watch-metadata[video-id="${esc}"]`
+  );
+  const out = [];
+  for (const meta of metas) {
+    const el = findTitleInWatchMetadata(meta);
+    if (el) out.push(el);
+  }
+  return out;
+}
+
 function findTitleElement(scope, videoId) {
   if (!scope || !videoId) return null;
   const onShorts = location.pathname.startsWith("/shorts/");
@@ -453,10 +478,10 @@ function tick(sess, key) {
   }
   const scope = getPlayerScopeRoot();
   if (!scope) return;
-  const el = findTitleElement(scope, sess.videoId);
-  if (!el) return;
 
   if (sess.lock === null) {
+    const el = findTitleElement(scope, sess.videoId);
+    if (!el) return;
     const meta = findWatchMetadataForVideo(scope, sess.videoId);
     if (
       meta &&
@@ -481,7 +506,21 @@ function tick(sess, key) {
     return;
   }
 
-  if (normalizeTitle(el.textContent) !== sess.lock) {
+  let titleEls = findAllWatchTitleElementsForVideo(scope, sess.videoId);
+  if (titleEls.length === 0) {
+    const one = findTitleElement(scope, sess.videoId);
+    titleEls = one ? [one] : [];
+  }
+  if (titleEls.length === 0) return;
+
+  let anyDiff = false;
+  for (const tel of titleEls) {
+    if (normalizeTitle(tel.textContent) !== sess.lock) {
+      anyDiff = true;
+      break;
+    }
+  }
+  if (anyDiff) {
     // #region agent log
     const ak = `${sess.videoId}:${sess.lock?.slice(0, 20)}`;
     const t0 = __ytDbgApplyKeyTs[ak] || 0;
@@ -491,13 +530,18 @@ function tick(sess, key) {
       __ytDbg("H-B,H-E", "content.js:tick", "applyLockToTitleEl", {
         sessVideoId: sess.videoId,
         liveId,
+        nTitleEls: titleEls.length,
         metaVideoId: meta ? meta.getAttribute("video-id") : null,
-        h1Before: normalizeTitle(el.textContent).slice(0, 100),
+        h1Before: normalizeTitle(titleEls[0].textContent).slice(0, 100),
         lockSample: String(sess.lock || "").slice(0, 100),
       });
     }
     // #endregion
-    el.textContent = sess.lock;
+    for (const tel of titleEls) {
+      if (normalizeTitle(tel.textContent) !== sess.lock) {
+        tel.textContent = sess.lock;
+      }
+    }
   }
   setPendingHide(false);
 }
