@@ -170,6 +170,12 @@ function getLiveVideoId(navDetail) {
   }
 
   if (fromNav) return fromNav;
+
+  // Watch: during SPA transitions, `ytd-player` can still expose the *previous* video-id
+  // while `?v=` already matches the new video — preferring only the player kept the old lock.
+  if (fromUrl && fromPlayer && fromUrl !== fromPlayer) {
+    return fromUrl;
+  }
   if (fromPlayer) return fromPlayer;
   return fromUrl;
 }

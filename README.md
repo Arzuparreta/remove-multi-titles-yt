@@ -27,6 +27,10 @@ Temporary add-ons are removed when Firefox closes; load again if you need it bac
 
 The first time you open a video, the title you see is saved locally. Next visits reuse that string. Nothing is sent to a server.
 
+## Automated tests (Playwright)
+
+Chromium is launched **with this folder as the unpacked extension** so you can reproduce title bugs without clicking through your daily browser. See [tests/README.md](tests/README.md): `npm install`, then `npm run test:e2e`. If your terminal has **no `DISPLAY`** (common in SSH or some IDE terminals), install **Xvfb** (`sudo pacman -S xorg-server-xvfb` on Arch/CachyOS) so the script can use a virtual screen; or run from a normal desktop terminal.
+
 ---
 
 The extension will be published on the official Chrome Web Store and Firefox Add-ons (AMO) when it is ready; until then, use the steps above.
