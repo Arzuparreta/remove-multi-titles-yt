@@ -53,9 +53,14 @@ async function dumpWatchDebug(page) {
     const firstInnerH1 = document
       .querySelector("#primary-inner h1.ytd-watch-metadata")
       ?.textContent?.trim();
+    const flexyVideoId =
+      document
+        .querySelector("#primary-inner ytd-watch-flexy, ytd-watch-flexy")
+        ?.getAttribute("video-id") ?? null;
     return {
       href,
       vFromUrl,
+      flexyVideoId,
       players,
       metasPrimary,
       metasInner,
@@ -73,6 +78,7 @@ function logDomDump(label, extra, dump) {
     data: {
       ...extra,
       vFromUrl: dump.vFromUrl,
+      flexyVideoId: dump.flexyVideoId,
       playerVideoIds: dump.players.map((p) => p.videoId),
       metasPrimary: dump.metasPrimary,
       metasInner: dump.metasInner,

@@ -156,6 +156,14 @@ function extractVideoIdFromYtNavigateDetail(detail) {
  * location.href — the URL can lag SPA swaps, so the extension would keep the first video's
  * lock and overwrite the h1 for every subsequent watch.
  */
+function getWatchFlexyVideoIdInScope(scope) {
+  if (!scope || typeof scope.querySelector !== "function") return null;
+  const flexy = scope.querySelector("ytd-watch-flexy");
+  if (!flexy) return null;
+  const m = flexy.getAttribute("video-id")?.match(YT_ID_RE);
+  return m ? m[0] : null;
+}
+
 function getLivePlayerVideoId() {
   const scope =
     document.querySelector("#primary-inner") ||
@@ -179,6 +187,9 @@ function getLivePlayerVideoId() {
     if (m) return m[0];
   }
 
+  const fromFlexy = getWatchFlexyVideoIdInScope(scope);
+  if (fromFlexy) return fromFlexy;
+
   return null;
 }
 
@@ -193,6 +204,11 @@ function recordYtNavigateTarget(detail) {
 /** Single source of truth for "which video is this page showing?" */
 function getLiveVideoId(navDetail) {
   const fromNav = extractVideoIdFromYtNavigateDetail(navDetail);
+  const scope =
+    document.querySelector("#primary-inner") ||
+    document.querySelector("#primary") ||
+    document.querySelector("ytd-watch-flexy");
+  const fromFlexy = scope ? getWatchFlexyVideoIdInScope(scope) : null;
   const fromPlayer = getLivePlayerVideoId();
   const fromUrl = extractVideoId(location.href);
 
@@ -202,16 +218,26 @@ function getLiveVideoId(navDetail) {
 
   if (fromNav) return fromNav;
 
-  // Watch: ?v= and primary-inner metadata/player can update in different orders. Prefer
-  // YouTube's navigate target shortly after a nav; otherwise prefer URL (stable for cold loads).
+  const age = Date.now() - lastYtNavTargetTs;
+  const fresh =
+    lastYtNavTargetVideoId && age >= 0 && age < 12000;
+
+  // tick() always passes navDetail=null; yt target id still helps for many ticks after SPA.
+  const trio = [fromUrl, fromPlayer, fromFlexy].filter(Boolean);
+  const trioSet = new Set(trio);
+  if (trioSet.size > 1 && fresh) {
+    if (lastYtNavTargetVideoId === fromUrl) return fromUrl;
+    if (lastYtNavTargetVideoId === fromPlayer) return fromPlayer;
+    if (lastYtNavTargetVideoId === fromFlexy) return fromFlexy;
+  }
+
+  // Watch: ?v= and primary-inner metadata/player/flexy can update in different orders.
   if (fromUrl && fromPlayer && fromUrl !== fromPlayer) {
-    const age = Date.now() - lastYtNavTargetTs;
-    const fresh =
-      lastYtNavTargetVideoId && age >= 0 && age < 5000;
     let picked = fromUrl;
     if (fresh) {
       if (lastYtNavTargetVideoId === fromPlayer) picked = fromPlayer;
       else if (lastYtNavTargetVideoId === fromUrl) picked = fromUrl;
+      else if (lastYtNavTargetVideoId === fromFlexy) picked = fromFlexy;
     }
     // #region agent log
     const __now = Date.now();
@@ -219,6 +245,30 @@ function getLiveVideoId(navDetail) {
       __ytDbgDisagreeLogTs = __now;
       __ytDbg("H-A", "content.js:getLiveVideoId", "idDisagree", {
         fromUrl,
+        fromPlayer,
+        fromFlexy,
+        lastYtNavTargetVideoId,
+        navAgeMs: age,
+        picked,
+      });
+    }
+    // #endregion
+    return picked;
+  }
+
+  if (fromUrl && fromFlexy && fromUrl !== fromFlexy) {
+    let picked = fromUrl;
+    if (fresh) {
+      if (lastYtNavTargetVideoId === fromFlexy) picked = fromFlexy;
+      else if (lastYtNavTargetVideoId === fromUrl) picked = fromUrl;
+    }
+    // #region agent log
+    const __n = Date.now();
+    if (__n - __ytDbgDisagreeLogTs > 350) {
+      __ytDbgDisagreeLogTs = __n;
+      __ytDbg("H-A", "content.js:getLiveVideoId", "idDisagreeUrlFlexy", {
+        fromUrl,
+        fromFlexy,
         fromPlayer,
         lastYtNavTargetVideoId,
         navAgeMs: age,
@@ -765,10 +815,15 @@ function runRouteSyncFromSources(navDetail) {
     const fromUrl = extractVideoId(location.href);
     const fromPlayer = getLivePlayerVideoId();
     const fromNav = extractVideoIdFromYtNavigateDetail(navDetail);
+    const rsScope =
+      document.querySelector("#primary-inner") ||
+      document.querySelector("#primary");
+    const fromFlexy = rsScope ? getWatchFlexyVideoIdInScope(rsScope) : null;
     __ytDbg("H-A,H-C", "content.js:runRouteSync", "routeSync", {
       chosen: id,
       fromUrl,
       fromPlayer,
+      fromFlexy,
       fromNav,
       path: location.pathname + location.search.slice(0, 80),
     });
