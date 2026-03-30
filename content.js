@@ -66,6 +66,9 @@ function __ytDbg(hypothesisId, location, message, data) {
 let lastYtNavTargetVideoId = null;
 let lastYtNavTargetTs = 0;
 
+/** Last ?v= seen from history.pushState/replaceState or popstate (location can lag the arg URL). */
+let lastHistoryWatchUrlId = null;
+
 /** @type {{ videoId: string, lock: string | null, observer: MutationObserver | null, rafId: number } | null} */
 let session = null;
 let sessionGeneration = 0;
@@ -150,13 +153,35 @@ function extractVideoId(href) {
   return null;
 }
 
+function watchPageShellPresent() {
+  // Do not use #primary-inner alone — it exists on home/feed and would keep a stale lastHistory id.
+  return !!document.querySelector("ytd-watch-flexy");
+}
+
+function recordWatchUrlIdFromLocation() {
+  if (location.pathname.startsWith("/shorts/")) return;
+  const id = extractVideoId(location.href);
+  if (id) lastHistoryWatchUrlId = id;
+}
+
 /**
- * Watch id from address bar (not Shorts). Do not require pathname === /watch — some shells
- * keep other pathnames while ?v= updates; uw was null there → session stuck on first video.
+ * Watch id from address bar (not Shorts). Fallback: canonical link, then last history URL
+ * (pushState arg can carry ?v= before location.href updates). Last fallback only if watch
+ * shell is present so feed/home does not reuse a stale id.
  */
 function watchUrlVideoId() {
   if (location.pathname.startsWith("/shorts/")) return null;
-  return extractVideoId(location.href);
+  const fromBar = extractVideoId(location.href);
+  if (fromBar) return fromBar;
+  const canon = document.querySelector('link[rel="canonical"]');
+  if (canon?.href) {
+    const c = extractVideoId(canon.href);
+    if (c) return c;
+  }
+  if (watchPageShellPresent() && lastHistoryWatchUrlId) {
+    return lastHistoryWatchUrlId;
+  }
+  return null;
 }
 
 function extractVideoIdFromYtNavigateDetail(detail) {
@@ -870,12 +895,8 @@ function ensureGridObserver() {
 }
 
 function isWatchOrShortsUrl() {
-  const p = location.pathname;
-  return (
-    p.startsWith("/watch") ||
-    p.startsWith("/shorts/") ||
-    (p === "/" && location.search.includes("v="))
-  );
+  if (location.pathname.startsWith("/shorts/")) return true;
+  return watchUrlVideoId() !== null;
 }
 
 /** Single entry: resolve current video id and start or clear session. */
@@ -906,6 +927,7 @@ function runRouteSyncFromSources(navDetail) {
   }
   // #endregion
   if (!id) {
+    lastHistoryWatchUrlId = null;
     cleanupSession();
   } else {
     startSession(id);
@@ -939,6 +961,17 @@ function patchHistoryForYouTubeSpa() {
     if (typeof orig !== "function") return;
     history[name] = function (...args) {
       const ret = orig.apply(this, args);
+      try {
+        if (args.length >= 3 && typeof args[2] === "string") {
+          const abs = new URL(args[2], location.origin).href;
+          const hid = extractVideoId(abs);
+          if (hid) lastHistoryWatchUrlId = hid;
+        } else {
+          recordWatchUrlIdFromLocation();
+        }
+      } catch {
+        /* ignore */
+      }
       scheduleNavResync();
       return ret;
     };
@@ -985,7 +1018,10 @@ document.addEventListener(
   true
 );
 
-window.addEventListener("popstate", () => scheduleRouteSync(null));
+window.addEventListener("popstate", () => {
+  recordWatchUrlIdFromLocation();
+  scheduleRouteSync(null);
+});
 
 patchHistoryForYouTubeSpa();
 ensureVideoIdNavWatcher();
@@ -1018,11 +1054,16 @@ try {
           ).slice(0, 80),
         }))
       : [];
+    const canonEl = document.querySelector('link[rel="canonical"]');
     return JSON.stringify(
       {
         href: location.href,
         pathname: location.pathname,
         search: location.search,
+        canonicalHref: canonEl?.href || null,
+        canonicalVideoId: canonEl?.href ? extractVideoId(canonEl.href) : null,
+        lastHistoryWatchUrlId,
+        watchShell: watchPageShellPresent(),
         watchUrlId: watchUrlVideoId(),
         liveVideoId: getLiveVideoId(null),
         session: session
