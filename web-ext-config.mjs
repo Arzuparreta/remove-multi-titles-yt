@@ -25,6 +25,8 @@ export default {
     "dist/**",
     "web-ext-artifacts/**",
     ".cursor/**",
+    "assets",
+    "assets/**",
   ],
   build: {
     overwriteDest: true,

@@ -4,6 +4,7 @@
   "description": "YouTube title pin extension + optional Playwright E2E",
   "scripts": {
     "build:chrome-unpacked": "node scripts/sync-chrome-unpacked.mjs",
+    "build:icons": "python3 scripts/generate-icons.py assets/extension-icon-source.jpg -o icons",
     "build:amo": "web-ext build",
     "lint:ext": "web-ext lint",
     "postinstall": "playwright install chromium",

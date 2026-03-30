@@ -39,4 +39,17 @@ for (const name of fs.readdirSync(libDir)) {
   }
 }
 
+const iconsDir = path.join(root, "icons");
+const iconsOut = path.join(out, "icons");
+if (fs.existsSync(iconsDir)) {
+  fs.mkdirSync(iconsOut, { recursive: true });
+  for (const name of fs.readdirSync(iconsDir)) {
+    if (!name.endsWith(".png")) continue;
+    const p = path.join(iconsDir, name);
+    if (fs.statSync(p).isFile()) {
+      fs.copyFileSync(p, path.join(iconsOut, name));
+    }
+  }
+}
+
 console.log("Chrome unpacked →", out);

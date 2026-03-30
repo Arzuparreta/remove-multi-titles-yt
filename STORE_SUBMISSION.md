@@ -1,6 +1,6 @@
 # Store submission checklist (Chrome Web Store + Firefox Add-ons)
 
-Use this when you are ready to publish. **Icons are not in the repo yet**—add PNGs and an `icons` block in `manifest.json` before final upload if the store requires package icons (Chrome typically does).
+Use this when you are ready to publish. The repo includes **`icons/*.png`** (16–512) plus **`action.default_icon`** in `manifest.json`. Regenerate from the source JPEG with **`npm run build:icons`**.
 
 ## Build the ZIP (do not hand-zip the repo)
 
@@ -18,7 +18,7 @@ Upload the ZIP under **`dist-amo/`** to AMO. Alternatively, run the **Build AMO 
 
 Checklist:
 
-- [ ] Add icon files (e.g. `icons/icon16.png`, …) and an `icons` key in `manifest.json` if the store requires them.
+- [x] Icon PNGs under `icons/` and `icons` / `action` keys in `manifest.json` (see `npm run build:icons`).
 - [ ] Bump `version` in `manifest.json` when you ship an update.
 - [ ] Run `npm run build:amo` (or the GitHub Action)—do not zip the whole project folder; that would include junk and can fail validation.
 
