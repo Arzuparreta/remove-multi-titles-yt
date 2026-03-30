@@ -33,7 +33,6 @@ The first time you see a title for a video (watch page, Shorts, or a grid tile),
 |------|-----------|
 | Watch / Shorts | Apply pin or save first-seen **once per navigation**, with bounded retries (`PLAYER_RETRY_MS`), not a live DOM fight. |
 | Lists / grids | Debounced `MutationObserver` on `ytd-app` only for tile titles (separate from the watch title pipeline). |
-| Watch sidebar (compact recs) | **No title DOM pin** on `ytd-compact-*` under `#secondary`: mutating the title broke thumbnail SPA navigation while `<a href>` still worked. First-seen titles are still saved from the sidebar text when there is no pin yet. |
 | Video id | YouTube `yt-navigate-finish` detail when present; otherwise URL (`?v=` / Shorts path). |
 
 ## E2E tests (Playwright)

@@ -12,14 +12,33 @@
  * by mutating text nodes in place (and open shadow subtrees) instead of assigning
  * textContent on the component, which was destroying internal structure and could break
  * layout/hit-testing (e.g. sidebar thumbnail clicks).
- *
- * Narrowing: thumbnail shows ripple / pointer but does not navigate; the title
- * link still works. This script never intercepts clicks. The failure correlates
- * with setPinnedTitleText on watch-sidebar compact rows: YouTube’s thumbnail
- * uses SPA navigation tied to renderer state, while the title uses a normal
- * <a href>. We skip rewriting title DOM for those cards (storage seeding still
- * runs without mutating the row).
  */
+
+/**
+ * Bisect “sidebar thumbnail click does nothing”: set **at most one** property to `true`,
+ * reload the extension, retest. All `false` = shipping behaviour.
+ *
+ * How to read results (thumbnail opens video = “fixed”):
+ * | Flag | If this alone fixes it, suspect |
+ * |------|----------------------------------|
+ * | skipApplyGridLocks | Whole grid pipeline (DOM writes, storage batch, and/or when it runs). |
+ * | skipGridTitleDomWrites | Title DOM mutation (`setPinnedTitleText`), not storage/scan/observer. |
+ * | skipGridSubtreeObservers | MutationObservers re-firing `applyGridLocks` (timing/re-entrancy), not one-shot apply. |
+ * | skipPlayerTitle | Watch/Shorts **main** title pass affecting shared layout or navigation. |
+ * | skipHistoryStateMessage | Extra applies from `webNavigation` background pings racing SPA updates. |
+ * | skipInitialBootstrapSchedules | Only the first double-rAF + sync on load (before/without yt-navigate-finish). |
+ *
+ * Not covered here (discard manually): load without `lib/browser-polyfill.min.js`; disable
+ * the background script permission; another extension; Firefox vs Chrome.
+ */
+const DEBUG_DISCARD = {
+  skipApplyGridLocks: false,
+  skipGridTitleDomWrites: false,
+  skipGridSubtreeObservers: false,
+  skipPlayerTitle: false,
+  skipHistoryStateMessage: false,
+  skipInitialBootstrapSchedules: false,
+};
 
 const STORAGE_PREFIX = "ytTitleLock:";
 const YT_ID_RE = /[a-zA-Z0-9_-]{11}/;
@@ -67,18 +86,6 @@ let gridApplyGen = 0;
 let navApplyTimer = 0;
 /** @type {{ root: Element; filterPrimaryInner: boolean }[] | null} */
 let lastGridLayoutRoots = null;
-
-/** Compact recommendation tiles in the watch sidebar; pinning title text breaks thumbnail SPA nav. */
-function isWatchSidebarCompactCard(card) {
-  if (!card || typeof card.closest !== "function") return false;
-  if (!card.closest("#secondary")) return false;
-  const n = card.nodeName;
-  return (
-    n === "YTD-COMPACT-VIDEO-RENDERER" ||
-    n === "YTD-COMPACT-MOVIE-RENDERER" ||
-    n === "YTD-COMPACT-RADIO-RENDERER"
-  );
-}
 
 function storageKey(videoId) {
   return `${STORAGE_PREFIX}${videoId}`;
@@ -283,6 +290,7 @@ function findShortsTitleElement() {
 }
 
 async function applyPlayerTitle(navDetail) {
+  if (DEBUG_DISCARD.skipPlayerTitle) return;
   const videoId = currentPlayerVideoId(navDetail);
   if (!videoId) return;
 
@@ -492,7 +500,9 @@ function syncGridObservers() {
   disconnectGridSubtreeObservers();
 
   for (const { root, filterPrimaryInner } of layoutRoots) {
-    attachGridSubtreeObserver(root, filterPrimaryInner);
+    if (!DEBUG_DISCARD.skipGridSubtreeObservers) {
+      attachGridSubtreeObserver(root, filterPrimaryInner);
+    }
   }
 
   if (!gridAppStructureObserver) {
@@ -502,6 +512,7 @@ function syncGridObservers() {
 }
 
 async function applyGridLocks() {
+  if (DEBUG_DISCARD.skipApplyGridLocks) return;
   const myGen = ++gridApplyGen;
   if (!document.querySelector("ytd-app")) return;
 
@@ -538,7 +549,7 @@ async function applyGridLocks() {
   if (myGen !== gridApplyGen) return;
 
   const toSet = {};
-  for (const [card, { id, titleEl }] of byCard) {
+  for (const { id, titleEl } of byCard.values()) {
     const k = storageKey(id);
     const raw = data[k];
     let pin = null;
@@ -547,7 +558,7 @@ async function applyGridLocks() {
     }
     if (pin !== null) {
       if (
-        !isWatchSidebarCompactCard(card) &&
+        !DEBUG_DISCARD.skipGridTitleDomWrites &&
         normalizeTitle(getPinTextTarget(titleEl).textContent) !== pin
       ) {
         setPinnedTitleText(titleEl, pin);
@@ -572,6 +583,7 @@ async function applyGridLocks() {
 
 browser.runtime.onMessage.addListener((msg) => {
   if (msg && msg.type === "ytTitleLockHistoryState") {
+    if (DEBUG_DISCARD.skipHistoryStateMessage) return;
     scheduleApplyPlayerTitle(null);
     scheduleApplyGridLocks();
   }
@@ -597,8 +609,10 @@ syncGridObservers();
 
 requestAnimationFrame(() =>
   requestAnimationFrame(() => {
-    scheduleApplyPlayerTitle(null);
-    scheduleApplyGridLocks();
-    syncGridObservers();
+    if (!DEBUG_DISCARD.skipInitialBootstrapSchedules) {
+      scheduleApplyPlayerTitle(null);
+      scheduleApplyGridLocks();
+      syncGridObservers();
+    }
   })
 );
