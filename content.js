@@ -43,6 +43,28 @@ const GRID_CARD_TAGS = new Set([
 const GRID_SCAN_CAP = 500;
 const GRID_DEBOUNCE_MS = 250;
 
+// #region agent log
+let __ytDbgRouteTs = 0;
+let __ytDbgDisagreeLogTs = 0;
+let __ytDbgApplyKeyTs = {};
+function __ytDbg(hypothesisId, location, message, data) {
+  const now = Date.now();
+  const body = {
+    location,
+    message,
+    data,
+    timestamp: now,
+    hypothesisId,
+    runId: "debug-pre",
+  };
+  browser.runtime.sendMessage({ __ytTitleLockDbg: true, body }).catch(() => {});
+}
+// #endregion
+
+/** Last target video id from yt-navigate-* (used when ?v= and DOM disagree during SPA). */
+let lastYtNavTargetVideoId = null;
+let lastYtNavTargetTs = 0;
+
 /** @type {{ videoId: string, lock: string | null, observer: MutationObserver | null, rafId: number } | null} */
 let session = null;
 let sessionGeneration = 0;
@@ -159,6 +181,14 @@ function getLivePlayerVideoId() {
   return null;
 }
 
+function recordYtNavigateTarget(detail) {
+  const id = extractVideoIdFromYtNavigateDetail(detail);
+  if (id) {
+    lastYtNavTargetVideoId = id;
+    lastYtNavTargetTs = Date.now();
+  }
+}
+
 /** Single source of truth for "which video is this page showing?" */
 function getLiveVideoId(navDetail) {
   const fromNav = extractVideoIdFromYtNavigateDetail(navDetail);
@@ -171,7 +201,33 @@ function getLiveVideoId(navDetail) {
 
   if (fromNav) return fromNav;
 
-  // Watch: same-tab SPA updates the address bar; player / DOM often lag. Use ?v= first.
+  // Watch: ?v= and primary-inner metadata/player can update in different orders. Prefer
+  // YouTube's navigate target shortly after a nav; otherwise prefer URL (stable for cold loads).
+  if (fromUrl && fromPlayer && fromUrl !== fromPlayer) {
+    const age = Date.now() - lastYtNavTargetTs;
+    const fresh =
+      lastYtNavTargetVideoId && age >= 0 && age < 5000;
+    let picked = fromUrl;
+    if (fresh) {
+      if (lastYtNavTargetVideoId === fromPlayer) picked = fromPlayer;
+      else if (lastYtNavTargetVideoId === fromUrl) picked = fromUrl;
+    }
+    // #region agent log
+    const __now = Date.now();
+    if (__now - __ytDbgDisagreeLogTs > 350) {
+      __ytDbgDisagreeLogTs = __now;
+      __ytDbg("H-A", "content.js:getLiveVideoId", "idDisagree", {
+        fromUrl,
+        fromPlayer,
+        lastYtNavTargetVideoId,
+        navAgeMs: age,
+        picked,
+      });
+    }
+    // #endregion
+    return picked;
+  }
+
   if (fromUrl) return fromUrl;
   return fromPlayer;
 }
@@ -360,6 +416,12 @@ function tick(sess, key) {
   if (sess !== session) return;
   const liveId = getLiveVideoId(null);
   if (liveId && liveId !== sess.videoId) {
+    // #region agent log
+    __ytDbg("H-C", "content.js:tick", "liveIdVsSession", {
+      sessVideoId: sess.videoId,
+      liveId,
+    });
+    // #endregion
     startSession(liveId);
     return;
   }
@@ -394,6 +456,21 @@ function tick(sess, key) {
   }
 
   if (normalizeTitle(el.textContent) !== sess.lock) {
+    // #region agent log
+    const ak = `${sess.videoId}:${sess.lock?.slice(0, 20)}`;
+    const t0 = __ytDbgApplyKeyTs[ak] || 0;
+    if (Date.now() - t0 > 700) {
+      __ytDbgApplyKeyTs[ak] = Date.now();
+      const meta = findWatchMetadataForVideo(scope, sess.videoId);
+      __ytDbg("H-B,H-E", "content.js:tick", "applyLockToTitleEl", {
+        sessVideoId: sess.videoId,
+        liveId,
+        metaVideoId: meta ? meta.getAttribute("video-id") : null,
+        h1Before: normalizeTitle(el.textContent).slice(0, 100),
+        lockSample: String(sess.lock || "").slice(0, 100),
+      });
+    }
+    // #endregion
     el.textContent = sess.lock;
   }
   setPendingHide(false);
@@ -406,6 +483,10 @@ async function startSession(videoId) {
     tick(session, key);
     return;
   }
+
+  // #region agent log
+  const prevVideoId = session?.videoId ?? null;
+  // #endregion
 
   ensureHideStyle();
   cleanupSession();
@@ -435,6 +516,15 @@ async function startSession(videoId) {
     _capN: 0,
   };
   session = sess;
+
+  // #region agent log
+  __ytDbg("H-D", "content.js:startSession", "newSession", {
+    videoId,
+    prevVideoId,
+    hasLock: lock !== null,
+    lockSample: lock ? String(lock).slice(0, 100) : null,
+  });
+  // #endregion
 
   const deadline = Date.now() + PARENT_WAIT_MS;
 
@@ -598,6 +688,22 @@ function isWatchOrShortsUrl() {
 function runRouteSyncFromSources(navDetail) {
   ensureGridObserver();
   const id = getLiveVideoId(navDetail);
+  // #region agent log
+  const now = Date.now();
+  if (now - __ytDbgRouteTs > 450) {
+    __ytDbgRouteTs = now;
+    const fromUrl = extractVideoId(location.href);
+    const fromPlayer = getLivePlayerVideoId();
+    const fromNav = extractVideoIdFromYtNavigateDetail(navDetail);
+    __ytDbg("H-A,H-C", "content.js:runRouteSync", "routeSync", {
+      chosen: id,
+      fromUrl,
+      fromPlayer,
+      fromNav,
+      path: location.pathname + location.search.slice(0, 80),
+    });
+  }
+  // #endregion
   if (!id) {
     cleanupSession();
   } else {
@@ -662,8 +768,9 @@ function ensureVideoIdNavWatcher() {
 
 document.addEventListener(
   "yt-navigate-start",
-  () => {
+  (ev) => {
     ensureHideStyle();
+    recordYtNavigateTarget(ev.detail);
   },
   true
 );
@@ -671,6 +778,7 @@ document.addEventListener(
 document.addEventListener(
   "yt-navigate-finish",
   (ev) => {
+    recordYtNavigateTarget(ev.detail);
     scheduleRouteSync(ev.detail);
   },
   true
