@@ -1,6 +1,6 @@
 /**
- * Pins first-seen title per video on YouTube Watch / Shorts; re-applies after DOM swaps.
- * Depends on lib/browser-polyfill.min.js for cross-browser storage promises.
+ * Pins first-seen titles per YouTube video on the player (watch/shorts) and on grid cards
+ * (home, search, related, etc.). Depends on lib/browser-polyfill.min.js.
  */
 
 const TITLE_SELECTORS = [
@@ -17,9 +17,30 @@ const PARENT_WAIT_MS = 15000;
 
 const YT_ID_RE = /[a-zA-Z0-9_-]{11}/;
 
+const GRID_LINK_SEL = 'a[href*="watch?v="], a[href*="/shorts/"]';
+const GRID_CARD_TAGS = new Set([
+  "YTD-RICH-ITEM-RENDERER",
+  "YTD-VIDEO-RENDERER",
+  "YTD-GRID-VIDEO-RENDERER",
+  "YTD-COMPACT-VIDEO-RENDERER",
+  "YTD-RICH-GRID-MEDIA",
+  "YTD-REEL-ITEM-RENDERER",
+  "YTD-MOVIE-RENDERER",
+  "YTD-PLAYLIST-VIDEO-RENDERER",
+  "YTD-CHANNEL-VIDEO-RENDERER",
+  "YTD-PLAYLIST-PANEL-VIDEO-RENDERER",
+]);
+
+const GRID_SCAN_CAP = 500;
+const GRID_DEBOUNCE_MS = 250;
+
 /** @type {{ videoId: string, lock: string | null, observer: MutationObserver | null, rafId: number } | null} */
 let session = null;
 let sessionGeneration = 0;
+
+let gridObserver = null;
+let gridDebounceTimer = null;
+let gridApplyGen = 0;
 
 function storageKey(videoId) {
   return `${STORAGE_PREFIX}${videoId}`;
@@ -67,14 +88,39 @@ function extractVideoId(href) {
   return null;
 }
 
+/**
+ * Scope player title queries to the active watch/shorts column so document.querySelector
+ * does not hit a cached/hidden metadata node from a previous SPA navigation (bug: wrong title stuck).
+ */
+function getPlayerScopeRoot() {
+  const path = location.pathname;
+  if (path.startsWith("/shorts/")) {
+    return (
+      document.querySelector("ytd-shorts") ||
+      document.querySelector("#shorts-container") ||
+      document.querySelector("#primary-inner") ||
+      document.querySelector("#primary") ||
+      document.body
+    );
+  }
+  return (
+    document.querySelector("#primary-inner") ||
+    document.querySelector("#primary") ||
+    document.querySelector("ytd-watch-flexy")
+  );
+}
+
 function ensureHideStyle() {
   if (document.getElementById(STYLE_ID)) return;
-  const rules = TITLE_SELECTORS.map(
-    (sel) => `html.${PENDING_CLASS} ${sel}`
+  const watchScoped = TITLE_SELECTORS.map(
+    (sel) => `html.${PENDING_CLASS} #primary ${sel}`
+  ).join(",\n");
+  const shortsScoped = TITLE_SELECTORS.map(
+    (sel) => `html.${PENDING_CLASS} ytd-shorts ${sel}`
   ).join(",\n");
   const style = document.createElement("style");
   style.id = STYLE_ID;
-  style.textContent = `${rules} { visibility: hidden !important; }`;
+  style.textContent = `${watchScoped},\n${shortsScoped} { visibility: hidden !important; }`;
   (document.head || document.documentElement).appendChild(style);
 }
 
@@ -82,9 +128,10 @@ function setPendingHide(on) {
   document.documentElement.classList.toggle(PENDING_CLASS, on);
 }
 
-function findTitleElement() {
+function findTitleElement(scope) {
+  if (!scope) return null;
   for (const sel of TITLE_SELECTORS) {
-    const el = document.querySelector(sel);
+    const el = scope.querySelector(sel);
     if (!el) continue;
     const t = normalizeTitle(el.textContent);
     if (t) return el;
@@ -92,12 +139,14 @@ function findTitleElement() {
   return null;
 }
 
-function findStableParent() {
+function findStableParent(scope) {
+  if (!scope) return null;
   return (
-    document.querySelector("#above-the-fold") ||
-    document.querySelector("#title") ||
-    document.querySelector("ytd-watch-metadata") ||
-    null
+    scope.querySelector("#above-the-fold") ||
+    scope.querySelector("#title") ||
+    scope.querySelector("ytd-watch-metadata") ||
+    scope.querySelector("ytd-reel-video-renderer") ||
+    scope
   );
 }
 
@@ -117,7 +166,9 @@ function cleanupSession() {
  */
 function tick(sess, key) {
   if (sess !== session) return;
-  const el = findTitleElement();
+  const scope = getPlayerScopeRoot();
+  if (!scope) return;
+  const el = findTitleElement(scope);
   if (!el) return;
 
   if (sess.lock === null) {
@@ -178,7 +229,8 @@ async function startSession(videoId) {
 
   function frame() {
     if (sess !== session) return;
-    const parent = findStableParent();
+    const scope = getPlayerScopeRoot();
+    const parent = scope ? findStableParent(scope) : null;
     if (parent) {
       attachObserver(parent);
       tick(sess, key);
@@ -196,13 +248,111 @@ async function startSession(videoId) {
   frame();
 }
 
+function closestGridCard(el) {
+  let n = el;
+  while (n && n !== document.body) {
+    if (GRID_CARD_TAGS.has(n.nodeName)) return n;
+    n = n.parentElement;
+  }
+  return null;
+}
+
+function getGridTitleElement(card, link) {
+  const byId = card.querySelector("#video-title");
+  if (byId) return byId;
+  const inner = link.querySelector("yt-formatted-string");
+  if (inner) return inner;
+  return link;
+}
+
+function scheduleApplyGridLocks() {
+  if (gridDebounceTimer) clearTimeout(gridDebounceTimer);
+  gridDebounceTimer = setTimeout(() => {
+    gridDebounceTimer = null;
+    void applyGridLocks();
+  }, GRID_DEBOUNCE_MS);
+}
+
+async function applyGridLocks() {
+  const myGen = ++gridApplyGen;
+  const app = document.querySelector("ytd-app");
+  if (!app) return;
+
+  const anchors = app.querySelectorAll(GRID_LINK_SEL);
+  /** @type {Map<Element, { id: string, titleEl: Element }>} */
+  const byCard = new Map();
+  let scanned = 0;
+
+  for (const a of anchors) {
+    if (scanned++ > GRID_SCAN_CAP) break;
+    if (a.closest("ytd-watch-metadata")) continue;
+    const href = a.getAttribute("href");
+    if (!href) continue;
+    let id;
+    try {
+      id = extractVideoId(new URL(href, location.origin).href);
+    } catch {
+      continue;
+    }
+    if (!id) continue;
+    const card = closestGridCard(a);
+    if (!card) continue;
+    if (byCard.has(card)) continue;
+    const titleEl = getGridTitleElement(card, a);
+    if (!titleEl || !titleEl.textContent) continue;
+    byCard.set(card, { id, titleEl });
+  }
+
+  if (byCard.size === 0) return;
+
+  const keys = [...new Set([...byCard.values()].map((e) => storageKey(e.id)))];
+  const data = await browser.storage.local.get(keys);
+  if (myGen !== gridApplyGen) return;
+
+  const toSet = {};
+
+  for (const { id, titleEl } of byCard.values()) {
+    const key = storageKey(id);
+    const raw = data[key];
+    let lock = null;
+    if (isValidLockValue(raw)) {
+      lock = normalizeTitle(String(raw));
+    }
+    if (lock !== null) {
+      if (normalizeTitle(titleEl.textContent) !== lock) {
+        titleEl.textContent = lock;
+      }
+    } else {
+      const t = normalizeTitle(titleEl.textContent);
+      if (t) {
+        toSet[key] = t;
+        data[key] = t;
+      }
+    }
+  }
+
+  if (Object.keys(toSet).length > 0) {
+    await browser.storage.local.set(toSet);
+  }
+}
+
+function ensureGridObserver() {
+  if (gridObserver) return;
+  const app = document.querySelector("ytd-app");
+  if (!app) return;
+  gridObserver = new MutationObserver(() => scheduleApplyGridLocks());
+  gridObserver.observe(app, { childList: true, subtree: true });
+}
+
 function onRouteChange() {
+  ensureGridObserver();
   const id = extractVideoId(location.href);
   if (!id) {
     cleanupSession();
-    return;
+  } else {
+    startSession(id);
   }
-  startSession(id);
+  scheduleApplyGridLocks();
 }
 
 document.addEventListener(
@@ -216,6 +366,9 @@ document.addEventListener(
 
 document.addEventListener("yt-navigate-finish", onRouteChange, true);
 window.addEventListener("popstate", onRouteChange);
+
+ensureGridObserver();
+scheduleApplyGridLocks();
 
 const initialId = extractVideoId(location.href);
 if (initialId) startSession(initialId);

@@ -1,8 +1,8 @@
 # remove-multi-titles-yt
 
-YouTube sometimes A/B tests different titles for the same video. This extension remembers the first title you see for each video (on the watch page and Shorts) and keeps showing that one, so you are not bounced between variants.
+YouTube sometimes A/B tests different titles for the same video. This extension remembers the first title you see for each video and keeps showing that one in the player and in lists (home, subscriptions, search results, related videos, etc.), so you are not bounced between variants or re-clickbaited by a renamed tile.
 
-It only runs on youtube.com. It does not touch thumbnails or titles in the home feed—just the player page.
+It only runs on youtube.com. Thumbnails are unchanged; only title text is adjusted where the extension can match a video to a stored title.
 
 ## Install from source (Chrome / Chromium)
 

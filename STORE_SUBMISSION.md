@@ -29,7 +29,7 @@ This package includes **minified** third-party code: `lib/browser-polyfill.min.j
 
 ## Copy-paste: single purpose (short)
 
-> Pins the first title you see for each YouTube video on the watch and Shorts player pages so YouTube cannot keep switching the title for the same video on your screen.
+> Pins the first title you see for each YouTube video on the player and in lists (home, search, related, etc.) so YouTube cannot keep switching the title for the same video on your screen.
 
 ## Copy-paste: permission justifications
 
@@ -39,7 +39,7 @@ This package includes **minified** third-party code: `lib/browser-polyfill.min.j
 
 **Host permission `*://*.youtube.com/*`**
 
-> Needed so the extension can run only on YouTube and adjust the title element on watch and Shorts pages. It does not access other sites.
+> Needed so the extension can run only on YouTube and adjust title text on the player and on list-style pages. It does not access other sites.
 
 ## Copy-paste: data / user privacy (summary)
 
