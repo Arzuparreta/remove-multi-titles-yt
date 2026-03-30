@@ -27,6 +27,25 @@ Temporary add-ons are removed when Firefox closes; load again if you need it bac
 
 The first time you see a title for a video (watch page, Shorts, or a grid tile), it is saved locally. Later, that same string is shown again for that video id. Updates run **after navigation** (`yt-navigate-finish`, URL changes) with a few short retries so metadata can mount — there is **no** continuous MutationObserver on the big watch title, which avoided fighting YouTube’s UI. Nothing is sent to a server.
 
+### Architecture (v2)
+
+| Area | Behaviour |
+|------|-----------|
+| Watch / Shorts | Apply pin or save first-seen **once per navigation**, with bounded retries (`PLAYER_RETRY_MS`), not a live DOM fight. |
+| Lists / grids | Debounced `MutationObserver` on `ytd-app` only for tile titles (separate from the watch title pipeline). |
+| Video id | YouTube `yt-navigate-finish` detail when present; otherwise URL (`?v=` / Shorts path). |
+
+## E2E tests (Playwright)
+
+Optional. Loads this folder as the unpacked extension and checks **pin invariants** (same title after A→B→A, stability over several seconds on one page). YouTube does not A/B every video on every refresh, so tests do not assert “two variants appeared” — see [tests/README.md](tests/README.md).
+
+```bash
+npm install
+npm run test:e2e
+```
+
+Without a display (SSH/CI), use `npm run test:e2e:ci` or install Xvfb and use `scripts/run-playwright-e2e.sh`.
+
 ---
 
 The extension will be published on the official Chrome Web Store and Firefox Add-ons (AMO) when it is ready; until then, use the steps above.
