@@ -119,12 +119,59 @@ function extractVideoIdFromYtNavigateDetail(detail) {
     detail.watchEndpoint?.videoId,
     detail.reelWatchEndpoint?.videoId,
     detail.response?.currentVideoEndpoint?.watchEndpoint?.videoId,
+    detail.response?.metadata?.videoDetails?.videoId,
   ];
   for (const c of candidates) {
     const id = pick(c);
     if (id) return id;
   }
   return null;
+}
+
+/**
+ * What is actually loaded in the watch column (player / metadata). Prefer this over
+ * location.href — the URL can lag SPA swaps, so the extension would keep the first video's
+ * lock and overwrite the h1 for every subsequent watch.
+ */
+function getLivePlayerVideoId() {
+  const scope =
+    document.querySelector("#primary-inner") ||
+    document.querySelector("#primary") ||
+    document.querySelector("ytd-watch-flexy");
+  if (!scope) return null;
+
+  const players = Array.from(
+    scope.querySelectorAll("ytd-player#ytd-player, ytd-player")
+  );
+  for (let i = players.length - 1; i >= 0; i--) {
+    const raw = players[i].getAttribute("video-id");
+    const m = raw?.match(YT_ID_RE);
+    if (m) return m[0];
+  }
+
+  const metas = Array.from(scope.querySelectorAll("ytd-watch-metadata[video-id]"));
+  for (let i = metas.length - 1; i >= 0; i--) {
+    const raw = metas[i].getAttribute("video-id");
+    const m = raw?.match(YT_ID_RE);
+    if (m) return m[0];
+  }
+
+  return null;
+}
+
+/** Single source of truth for "which video is this page showing?" */
+function getLiveVideoId(navDetail) {
+  const fromNav = extractVideoIdFromYtNavigateDetail(navDetail);
+  const fromPlayer = getLivePlayerVideoId();
+  const fromUrl = extractVideoId(location.href);
+
+  if (location.pathname.startsWith("/shorts/")) {
+    return fromNav || fromUrl || fromPlayer;
+  }
+
+  if (fromNav) return fromNav;
+  if (fromPlayer) return fromPlayer;
+  return fromUrl;
 }
 
 function isElementVisible(el) {
@@ -303,6 +350,11 @@ function cleanupSession() {
  */
 function tick(sess, key) {
   if (sess !== session) return;
+  const liveId = getLiveVideoId(null);
+  if (liveId && liveId !== sess.videoId) {
+    startSession(liveId);
+    return;
+  }
   const scope = getPlayerScopeRoot();
   if (!scope) return;
   const el = findTitleElement(scope, sess.videoId);
@@ -506,9 +558,7 @@ function scheduleRouteSync(navDetail) {
   ensureGridObserver();
   const detail = navDetail;
   const run = () => {
-    const id =
-      extractVideoId(location.href) ||
-      extractVideoIdFromYtNavigateDetail(detail);
+    const id = getLiveVideoId(detail);
     if (!id) {
       cleanupSession();
     } else {
@@ -541,7 +591,9 @@ window.addEventListener("popstate", () => scheduleRouteSync(null));
 ensureGridObserver();
 scheduleApplyGridLocks();
 
-const bootId = extractVideoId(location.href);
-if (bootId) {
-  requestAnimationFrame(() => requestAnimationFrame(() => startSession(bootId)));
-}
+requestAnimationFrame(() =>
+  requestAnimationFrame(() => {
+    const id = getLiveVideoId(null);
+    if (id) startSession(id);
+  })
+);
