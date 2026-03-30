@@ -11,11 +11,15 @@
  * and uses webNavigation (background) instead of patching history. Title text is updated
  * by mutating text nodes in place (and open shadow subtrees) instead of assigning
  * textContent on the component, which was destroying internal structure and could break
- * layout/hit-testing (e.g. sidebar thumbnail clicks). A small injected stylesheet
- * restores clicks through the metadata column on watch sidebar compact rows.
+ * layout/hit-testing (e.g. sidebar thumbnail clicks).
+ *
+ * Narrowing: thumbnail shows ripple / pointer but does not navigate; the title
+ * link still works. This script never intercepts clicks. The failure correlates
+ * with setPinnedTitleText on watch-sidebar compact rows: YouTube’s thumbnail
+ * uses SPA navigation tied to renderer state, while the title uses a normal
+ * <a href>. We skip rewriting title DOM for those cards (storage seeding still
+ * runs without mutating the row).
  */
-
-const SIDEBAR_HITTEST_FIX_STYLE_ID = "yt-title-lock-sidebar-pe";
 
 const STORAGE_PREFIX = "ytTitleLock:";
 const YT_ID_RE = /[a-zA-Z0-9_-]{11}/;
@@ -64,29 +68,16 @@ let navApplyTimer = 0;
 /** @type {{ root: Element; filterPrimaryInner: boolean }[] | null} */
 let lastGridLayoutRoots = null;
 
-/**
- * On watch pages the #details column of compact recommendations often sits above the
- * thumbnail in stacking order; after title DOM tweaks, inert areas can still capture
- * clicks. pointer-events: none on #details with auto on real controls lets hits reach
- * ytd-thumbnail’s link (inherited none passes through padding/empty layout boxes).
- */
-function ensureSidebarHittestFix() {
-  if (document.getElementById(SIDEBAR_HITTEST_FIX_STYLE_ID)) return;
-  const style = document.createElement("style");
-  style.id = SIDEBAR_HITTEST_FIX_STYLE_ID;
-  style.textContent = `
-#secondary ytd-compact-video-renderer #details,
-#secondary ytd-compact-movie-renderer #details,
-#secondary ytd-compact-radio-renderer #details {
-  pointer-events: none !important;
-}
-#secondary ytd-compact-video-renderer #details :is(a, button, input, select, textarea, [role="button"], ytd-button-renderer, ytd-icon-button, yt-icon-button, tp-yt-paper-icon-button, ytd-menu-renderer, ytd-toggle-button-renderer),
-#secondary ytd-compact-movie-renderer #details :is(a, button, input, select, textarea, [role="button"], ytd-button-renderer, ytd-icon-button, yt-icon-button, tp-yt-paper-icon-button, ytd-menu-renderer, ytd-toggle-button-renderer),
-#secondary ytd-compact-radio-renderer #details :is(a, button, input, select, textarea, [role="button"], ytd-button-renderer, ytd-icon-button, yt-icon-button, tp-yt-paper-icon-button, ytd-menu-renderer, ytd-toggle-button-renderer) {
-  pointer-events: auto !important;
-}
-`.trim();
-  (document.head || document.documentElement).appendChild(style);
+/** Compact recommendation tiles in the watch sidebar; pinning title text breaks thumbnail SPA nav. */
+function isWatchSidebarCompactCard(card) {
+  if (!card || typeof card.closest !== "function") return false;
+  if (!card.closest("#secondary")) return false;
+  const n = card.nodeName;
+  return (
+    n === "YTD-COMPACT-VIDEO-RENDERER" ||
+    n === "YTD-COMPACT-MOVIE-RENDERER" ||
+    n === "YTD-COMPACT-RADIO-RENDERER"
+  );
 }
 
 function storageKey(videoId) {
@@ -547,7 +538,7 @@ async function applyGridLocks() {
   if (myGen !== gridApplyGen) return;
 
   const toSet = {};
-  for (const { id, titleEl } of byCard.values()) {
+  for (const [card, { id, titleEl }] of byCard) {
     const k = storageKey(id);
     const raw = data[k];
     let pin = null;
@@ -555,7 +546,10 @@ async function applyGridLocks() {
       pin = normalizeTitle(String(raw));
     }
     if (pin !== null) {
-      if (normalizeTitle(getPinTextTarget(titleEl).textContent) !== pin) {
+      if (
+        !isWatchSidebarCompactCard(card) &&
+        normalizeTitle(getPinTextTarget(titleEl).textContent) !== pin
+      ) {
         setPinnedTitleText(titleEl, pin);
       }
     } else {
@@ -586,7 +580,6 @@ browser.runtime.onMessage.addListener((msg) => {
 document.addEventListener(
   "yt-navigate-finish",
   (ev) => {
-    ensureSidebarHittestFix();
     scheduleApplyPlayerTitle(ev.detail);
     scheduleApplyGridLocks();
     syncGridObservers();
@@ -595,18 +588,15 @@ document.addEventListener(
 );
 
 window.addEventListener("popstate", () => {
-  ensureSidebarHittestFix();
   scheduleApplyPlayerTitle(null);
   scheduleApplyGridLocks();
   syncGridObservers();
 });
 
-ensureSidebarHittestFix();
 syncGridObservers();
 
 requestAnimationFrame(() =>
   requestAnimationFrame(() => {
-    ensureSidebarHittestFix();
     scheduleApplyPlayerTitle(null);
     scheduleApplyGridLocks();
     syncGridObservers();
