@@ -106,6 +106,92 @@ function extractVideoId(href) {
   return null;
 }
 
+function extractVideoIdFromYtNavigateDetail(detail) {
+  if (!detail || typeof detail !== "object") return null;
+  const pick = (x) => {
+    if (!x || typeof x !== "string") return null;
+    const m = x.match(YT_ID_RE);
+    return m ? m[0] : null;
+  };
+  const candidates = [
+    detail.endpoint?.watchEndpoint?.videoId,
+    detail.endpoint?.reelWatchEndpoint?.videoId,
+    detail.watchEndpoint?.videoId,
+    detail.reelWatchEndpoint?.videoId,
+    detail.response?.currentVideoEndpoint?.watchEndpoint?.videoId,
+  ];
+  for (const c of candidates) {
+    const id = pick(c);
+    if (id) return id;
+  }
+  return null;
+}
+
+function isElementVisible(el) {
+  if (!el) return false;
+  if (el.hidden) return false;
+  const st = getComputedStyle(el);
+  if (st.display === "none" || st.visibility === "hidden") return false;
+  return el.offsetParent !== null || st.position === "fixed";
+}
+
+function metadataMatchesVideo(meta, videoId) {
+  const vid = meta.getAttribute("video-id");
+  if (vid === videoId) return true;
+  for (const a of meta.querySelectorAll("a[href]")) {
+    try {
+      const id = extractVideoId(
+        new URL(a.getAttribute("href") || "", location.origin).href
+      );
+      if (id === videoId) return true;
+    } catch {
+      continue;
+    }
+  }
+  return false;
+}
+
+/**
+ * After SPA navigation YouTube can leave multiple ytd-watch-metadata nodes in #primary.
+ * Always pick the block for this video, or the last visible one (newest mount).
+ */
+function findWatchMetadataForVideo(scope, videoId) {
+  if (!scope || !videoId) return null;
+  const all = Array.from(scope.querySelectorAll("ytd-watch-metadata"));
+  if (all.length === 0) return null;
+
+  const matched = all.filter((m) => metadataMatchesVideo(m, videoId));
+  const pool = matched.length ? matched : all;
+
+  const visible = pool.filter(isElementVisible);
+  const pickFrom = visible.length ? visible : pool;
+  return pickFrom[pickFrom.length - 1];
+}
+
+function findStableParentForWatchMeta(meta, scope) {
+  if (!meta) return null;
+  const fold = meta.closest("#above-the-fold");
+  if (fold && scope.contains(fold)) return fold;
+  const flexy = meta.closest("ytd-watch-flexy");
+  if (flexy && scope.contains(flexy)) return flexy;
+  return meta;
+}
+
+function findShortsStableParent(scope, videoId) {
+  if (!scope) return null;
+  const byAttr = scope.querySelector(
+    `ytd-reel-video-renderer[video-id="${videoId}"]`
+  );
+  if (byAttr) return byAttr;
+  const reels = Array.from(scope.querySelectorAll("ytd-reel-video-renderer"));
+  for (const r of reels) {
+    if (metadataMatchesVideo(r, videoId)) return r;
+  }
+  const vis = reels.filter(isElementVisible);
+  if (vis.length) return vis[vis.length - 1];
+  return scope.querySelector("ytd-shorts") || scope;
+}
+
 /**
  * Scope player title queries to the active watch/shorts column so document.querySelector
  * does not hit a cached/hidden metadata node from a previous SPA navigation (bug: wrong title stuck).
@@ -146,41 +232,47 @@ function setPendingHide(on) {
   document.documentElement.classList.toggle(PENDING_CLASS, on);
 }
 
-function findTitleElement(scope) {
-  if (!scope) return null;
-  const onShorts = location.pathname.startsWith("/shorts/");
-
-  if (!onShorts) {
-    const meta = scope.querySelector("ytd-watch-metadata");
-    if (!meta) return null;
-    const headSelectors = [
-      "h1.ytd-watch-metadata",
-      "#title h1",
-      "h1",
-    ];
-    for (const sel of headSelectors) {
-      const el = meta.querySelector(sel);
-      if (!el) continue;
-      const t = normalizeTitle(el.textContent);
-      if (t && !looksLikeTimestampOrDuration(t)) return el;
-    }
-    const titleRoot = meta.querySelector("#title");
-    if (titleRoot) {
-      for (const fs of titleRoot.querySelectorAll("yt-formatted-string")) {
-        const t = normalizeTitle(fs.textContent);
-        if (t && !looksLikeTimestampOrDuration(t)) return fs;
-      }
-    }
-    return null;
-  }
-
-  for (const sel of SHORTS_TITLE_SELECTORS) {
-    const el = scope.querySelector(sel);
+function findTitleInWatchMetadata(meta) {
+  if (!meta) return null;
+  const headSelectors = [
+    "h1.ytd-watch-metadata",
+    "#title h1",
+    "h1",
+  ];
+  for (const sel of headSelectors) {
+    const el = meta.querySelector(sel);
     if (!el) continue;
     const t = normalizeTitle(el.textContent);
     if (t && !looksLikeTimestampOrDuration(t)) return el;
   }
-  const shortsFormatted = scope.querySelectorAll(
+  const titleRoot = meta.querySelector("#title");
+  if (titleRoot) {
+    for (const fs of titleRoot.querySelectorAll("yt-formatted-string")) {
+      const t = normalizeTitle(fs.textContent);
+      if (t && !looksLikeTimestampOrDuration(t)) return fs;
+    }
+  }
+  return null;
+}
+
+function findTitleElement(scope, videoId) {
+  if (!scope || !videoId) return null;
+  const onShorts = location.pathname.startsWith("/shorts/");
+
+  if (!onShorts) {
+    const meta = findWatchMetadataForVideo(scope, videoId);
+    return findTitleInWatchMetadata(meta);
+  }
+
+  const reel = findShortsStableParent(scope, videoId);
+  const reelScope = reel || scope;
+  for (const sel of SHORTS_TITLE_SELECTORS) {
+    const el = reelScope.querySelector(sel);
+    if (!el) continue;
+    const t = normalizeTitle(el.textContent);
+    if (t && !looksLikeTimestampOrDuration(t)) return el;
+  }
+  const shortsFormatted = reelScope.querySelectorAll(
     "yt-formatted-string.ytd-watch-metadata, yt-formatted-string#shorts-title"
   );
   let best = null;
@@ -193,17 +285,6 @@ function findTitleElement(scope) {
     }
   }
   return best;
-}
-
-function findStableParent(scope) {
-  if (!scope) return null;
-  return (
-    scope.querySelector("#above-the-fold") ||
-    scope.querySelector("#title") ||
-    scope.querySelector("ytd-watch-metadata") ||
-    scope.querySelector("ytd-reel-video-renderer") ||
-    scope
-  );
 }
 
 function cleanupSession() {
@@ -224,7 +305,7 @@ function tick(sess, key) {
   if (sess !== session) return;
   const scope = getPlayerScopeRoot();
   if (!scope) return;
-  const el = findTitleElement(scope);
+  const el = findTitleElement(scope, sess.videoId);
   if (!el) return;
 
   if (sess.lock === null) {
@@ -290,7 +371,24 @@ async function startSession(videoId) {
   function frame() {
     if (sess !== session) return;
     const scope = getPlayerScopeRoot();
-    const parent = scope ? findStableParent(scope) : null;
+    if (!scope || !sess.videoId) {
+      if (Date.now() >= deadline) {
+        setPendingHide(false);
+        sess.rafId = 0;
+        return;
+      }
+      sess.rafId = requestAnimationFrame(frame);
+      return;
+    }
+
+    let parent = null;
+    if (location.pathname.startsWith("/shorts/")) {
+      parent = findShortsStableParent(scope, sess.videoId);
+    } else {
+      const meta = findWatchMetadataForVideo(scope, sess.videoId);
+      parent = findStableParentForWatchMeta(meta, scope);
+    }
+
     if (parent) {
       attachObserver(parent);
       tick(sess, key);
@@ -404,15 +502,21 @@ function ensureGridObserver() {
   gridObserver.observe(app, { childList: true, subtree: true });
 }
 
-function onRouteChange() {
+function scheduleRouteSync(navDetail) {
   ensureGridObserver();
-  const id = extractVideoId(location.href);
-  if (!id) {
-    cleanupSession();
-  } else {
-    startSession(id);
-  }
-  scheduleApplyGridLocks();
+  const detail = navDetail;
+  const run = () => {
+    const id =
+      extractVideoId(location.href) ||
+      extractVideoIdFromYtNavigateDetail(detail);
+    if (!id) {
+      cleanupSession();
+    } else {
+      startSession(id);
+    }
+    scheduleApplyGridLocks();
+  };
+  requestAnimationFrame(() => requestAnimationFrame(run));
 }
 
 document.addEventListener(
@@ -424,11 +528,20 @@ document.addEventListener(
   true
 );
 
-document.addEventListener("yt-navigate-finish", onRouteChange, true);
-window.addEventListener("popstate", onRouteChange);
+document.addEventListener(
+  "yt-navigate-finish",
+  (ev) => {
+    scheduleRouteSync(ev.detail);
+  },
+  true
+);
+
+window.addEventListener("popstate", () => scheduleRouteSync(null));
 
 ensureGridObserver();
 scheduleApplyGridLocks();
 
-const initialId = extractVideoId(location.href);
-if (initialId) startSession(initialId);
+const bootId = extractVideoId(location.href);
+if (bootId) {
+  requestAnimationFrame(() => requestAnimationFrame(() => startSession(bootId)));
+}
