@@ -48,7 +48,7 @@ Without a display (SSH/CI), use `npm run test:e2e:ci` or install Xvfb and use `s
 
 ---
 
-The extension will be published on the official Chrome Web Store and Firefox Add-ons (AMO) when it is ready; until then, use the steps above.
+The extension has been submitted to both the Chrome Web Store and Firefox Add-ons (AMO), and both listings are currently pending review; until approval, use the steps above.
 
 ## Build the Firefox / AMO upload ZIP (any computer)
 
