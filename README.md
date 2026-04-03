@@ -1,19 +1,19 @@
 # remove-multi-titles-yt
 
-YouTube sometimes A/B tests different titles for the same video. This extension remembers the first title you see for each video and keeps showing that one in the player and in lists (home, subscriptions, search results, related videos, etc.), so you are not bounced between variants or re-clickbaited by a renamed tile.
-
-It only runs on youtube.com. Thumbnails are unchanged; only title text is adjusted where the extension can match a video to a stored title.
-
-## Install (Firefox)
-
 <p>
   <a href="https://addons.mozilla.org/en-US/firefox/addon/remove-multi-titles-youtube/"
      target="_blank"
-     rel="noopener noreferrer"
-     style="display:inline-block; background:#FF7139; color:#fff; font-weight:600; padding:10px 18px; border-radius:4px; text-decoration:none; font-family:system-ui,sans-serif;">
-    Add to Firefox
+     rel="noopener noreferrer">
+    <img src="https://blog.mozilla.org/addons/files/2015/11/get-the-addon.png"
+         alt="Get the add-on for Firefox"
+         width="172"
+         height="60">
   </a>
 </p>
+
+YouTube sometimes A/B tests different titles for the same video. This extension remembers the first title you see for each video and keeps showing that one in the player and in lists (home, subscriptions, search results, related videos, etc.), so you are not bounced between variants or re-clickbaited by a renamed tile.
+
+It only runs on youtube.com. Thumbnails are unchanged; only title text is adjusted where the extension can match a video to a stored title.
 
 ## Install from source (Chrome / Chromium)
 
@@ -27,7 +27,7 @@ To update after pulling changes: run `npm run build:chrome-unpacked` again, then
 
 ## Install from source (Firefox)
 
-For normal use, install from Mozilla Add-ons (**Install (Firefox)** above).
+For normal use, install from Mozilla Add-ons (use the **Get the add-on** image at the top).
 
 1. Download or clone this repo.
 2. Open `about:debugging`.
