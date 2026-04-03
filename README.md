@@ -1,14 +1,7 @@
 # remove-multi-titles-yt
 
 <p>
-  <a href="https://addons.mozilla.org/en-US/firefox/addon/remove-multi-titles-youtube/"
-     target="_blank"
-     rel="noopener noreferrer">
-    <img src="https://blog.mozilla.org/addons/files/2015/11/get-the-addon.png"
-         alt="Get the add-on for Firefox"
-         width="172"
-         height="60">
-  </a>
+  <a href="https://addons.mozilla.org/en-US/firefox/addon/remove-multi-titles-youtube/" target="_blank" rel="noopener noreferrer"><img src="https://blog.mozilla.org/addons/files/2015/11/get-the-addon.png" alt="Get the add-on for Firefox" width="172" height="60"></a>
 </p>
 
 YouTube sometimes A/B tests different titles for the same video. This extension remembers the first title you see for each video and keeps showing that one in the player and in lists (home, subscriptions, search results, related videos, etc.), so you are not bounced between variants or re-clickbaited by a renamed tile.
@@ -61,7 +54,7 @@ Without a display (SSH/CI), use `npm run test:e2e:ci` or install Xvfb and use `s
 
 ---
 
-The Firefox build is [published on Mozilla Add-ons](https://addons.mozilla.org/en-US/firefox/addon/remove-multi-titles-youtube/). The Chrome Web Store version is still pending review.
+The Firefox build is <a href="https://addons.mozilla.org/en-US/firefox/addon/remove-multi-titles-youtube/" target="_blank" rel="noopener noreferrer">published on Mozilla Add-ons</a>. The Chrome Web Store version is still pending review.
 
 ## Build the Firefox / AMO upload ZIP (any computer)
 
