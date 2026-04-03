@@ -4,6 +4,17 @@ YouTube sometimes A/B tests different titles for the same video. This extension 
 
 It only runs on youtube.com. Thumbnails are unchanged; only title text is adjusted where the extension can match a video to a stored title.
 
+## Install (Firefox)
+
+<p>
+  <a href="https://addons.mozilla.org/en-US/firefox/addon/remove-multi-titles-youtube/"
+     target="_blank"
+     rel="noopener noreferrer"
+     style="display:inline-block; background:#FF7139; color:#fff; font-weight:600; padding:10px 18px; border-radius:4px; text-decoration:none; font-family:system-ui,sans-serif;">
+    Add to Firefox
+  </a>
+</p>
+
 ## Install from source (Chrome / Chromium)
 
 Chrome Manifest V3 only allows a **service worker** background. Firefox (and `web-ext` builds for AMO) use **`background.scripts`**, which Chrome rejects—so this repo keeps **Firefox** `manifest.json` at the project root and generates a Chrome bundle.
@@ -15,6 +26,8 @@ Chrome Manifest V3 only allows a **service worker** background. Firefox (and `we
 To update after pulling changes: run `npm run build:chrome-unpacked` again, then **Reload** the extension in Chrome.
 
 ## Install from source (Firefox)
+
+For normal use, install from Mozilla Add-ons (**Install (Firefox)** above).
 
 1. Download or clone this repo.
 2. Open `about:debugging`.
@@ -48,7 +61,7 @@ Without a display (SSH/CI), use `npm run test:e2e:ci` or install Xvfb and use `s
 
 ---
 
-The extension has been submitted to both the Chrome Web Store and Firefox Add-ons (AMO), and both listings are currently pending review; until approval, use the steps above.
+The Firefox build is [published on Mozilla Add-ons](https://addons.mozilla.org/en-US/firefox/addon/remove-multi-titles-youtube/). The Chrome Web Store version is still pending review.
 
 ## Build the Firefox / AMO upload ZIP (any computer)
 
