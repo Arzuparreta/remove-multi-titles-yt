@@ -1,0 +1,12 @@
+.cursor/
+.DS_Store
+Thumbs.db
+*.zip
+node_modules/
+playwright-report/
+test-results/
+blob-report/
+playwright/.cache/
+dist-amo/
+dist/chrome-unpacked/
+web-ext-artifacts/

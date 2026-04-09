@@ -1,0 +1,24 @@
+{
+  "name": "remove-multi-titles-yt",
+  "private": true,
+  "description": "YouTube title pin extension + optional Playwright E2E",
+  "scripts": {
+    "build:chrome-unpacked": "node scripts/sync-chrome-unpacked.mjs",
+    "build:chrome-zip": "npm run build:chrome-unpacked && python3 scripts/zip-chrome-unpacked.py",
+    "build:icons": "python3 scripts/generate-icons.py assets/extension-icon-source.jpg -o icons",
+    "build:amo": "web-ext build",
+    "lint:ext": "web-ext lint",
+    "postinstall": "playwright install chromium",
+    "test:e2e": "sh scripts/run-playwright-e2e.sh",
+    "pretest:e2e:headed": "npm run build:chrome-unpacked",
+    "test:e2e:headed": "playwright test",
+    "pretest:e2e:ci": "npm run build:chrome-unpacked",
+    "test:e2e:ci": "xvfb-run -a playwright test",
+    "test:e2e:ui": "playwright test --ui",
+    "test:debug:sidebar": "sh scripts/run-sidebar-debug.sh"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.49.1",
+    "web-ext": "^8.3.0"
+  }
+}
