@@ -74,10 +74,3 @@ The ZIP appears under **`dist-amo/`** (name includes the version from `manifest.
 **Without installing anything locally**
 
 After this workflow is on the default branch: open the repo on GitHub → **Actions** → **Build AMO package** → **Run workflow**. When the run finishes, download the **`firefox-amo-zip`** artifact from the run page.
-
-## Before store submission
-
-- Follow **[STORE_SUBMISSION.md](STORE_SUBMISSION.md)** (ZIP layout, privacy URL, copy-paste text for reviewers).
-- Host **[PRIVACY.md](PRIVACY.md)** at a public URL for both stores.
-- License: **[LICENSE](LICENSE)** (MIT). Third-party: **[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)**.
-- **Icons:** add your PNGs and an `icons` entry in `manifest.json` when the artwork is ready (required for typical store uploads).
