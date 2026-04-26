@@ -21,6 +21,7 @@
  */
 
 const STORAGE_PREFIX = "ytTitleLock:";
+const THUMB_STORAGE_PREFIX = "ytThumbLock:";
 const YT_ID_RE = /[a-zA-Z0-9_-]{11}/;
 const GRID_DEBOUNCE_MS = 300;
 const GRID_RESYNC_DEBOUNCE_MS = 800;
@@ -76,6 +77,10 @@ let lastGridLayoutRoots = null;
 
 function storageKey(videoId) {
   return `${STORAGE_PREFIX}${videoId}`;
+}
+
+function thumbStorageKey(videoId) {
+  return `${THUMB_STORAGE_PREFIX}${videoId}`;
 }
 
 function normalizeTitle(s) {
@@ -239,6 +244,35 @@ function setPinnedTitleText(host, pin) {
   target.textContent = lock;
 }
 
+function extractThumbnailUrl(element) {
+  if (!element) return null;
+
+  const img = element.querySelector('img[src*="ytimg.com"]');
+  if (img) return img.src;
+
+  const style = element.style?.backgroundImage;
+  if (style && style.includes('ytimg.com')) {
+    const match = style.match(/url\(["']?([^"')]+)["']?\)/);
+    return match ? match[1] : null;
+  }
+
+  return null;
+}
+
+function setPinnedThumbnail(element, url) {
+  if (!element || !url) return;
+
+  const img = element.querySelector('img');
+  if (img && img.src !== url) {
+    img.src = url;
+    return;
+  }
+
+  if (element.style?.backgroundImage) {
+    element.style.backgroundImage = `url('${url}')`;
+  }
+}
+
 function findWatchTitleElement(videoId) {
   if (!videoId) return null;
   const scope =
@@ -323,12 +357,66 @@ async function applyPlayerTitle(navDetail) {
   }
 }
 
+async function applyPlayerThumbnail(navDetail) {
+  const videoId = currentPlayerVideoId(navDetail);
+  if (!videoId) return;
+
+  const onShorts = location.pathname.startsWith("/shorts/");
+  const key = thumbStorageKey(videoId);
+  let lock = null;
+
+  try {
+    const stored = await browser.storage.local.get(key);
+    const raw = stored[key];
+    if (raw && typeof raw === 'string' && raw.includes('ytimg.com')) {
+      lock = raw;
+    }
+  } catch {
+    return;
+  }
+
+  const pickEl = () => {
+    if (onShorts) {
+      return document.querySelector('ytd-shorts ytd-thumbnail') ||
+             document.querySelector('#shorts-container ytd-thumbnail');
+    }
+    const scope = document.querySelector("#primary-inner") || document.querySelector("#primary");
+    return scope?.querySelector(`ytd-watch-metadata[video-id="${cssEsc(videoId)}"] ytd-thumbnail`);
+  };
+
+  let cumulative = 0;
+  for (let i = 0; i < PLAYER_RETRY_MS.length; i++) {
+    const wait = PLAYER_RETRY_MS[i] - cumulative;
+    cumulative = PLAYER_RETRY_MS[i];
+    if (wait > 0) {
+      await new Promise((r) => setTimeout(r, wait));
+    }
+    const el = pickEl();
+    if (!el) continue;
+
+    if (lock !== null) {
+      setPinnedThumbnail(el, lock);
+    } else {
+      const native = extractThumbnailUrl(el);
+      if (native) {
+        try {
+          await browser.storage.local.set({ [key]: native });
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+    return;
+  }
+}
+
 function scheduleApplyPlayerTitle(navDetail) {
   if (navApplyTimer) clearTimeout(navApplyTimer);
   const d = navDetail;
   navApplyTimer = setTimeout(() => {
     navApplyTimer = 0;
     void applyPlayerTitle(d);
+    void applyPlayerThumbnail(d);
   }, NAV_APPLY_DEBOUNCE_MS);
 }
 
@@ -572,6 +660,49 @@ async function applyGridLocks() {
   if (Object.keys(toSet).length > 0) {
     try {
       await browser.storage.local.set(toSet);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  // Thumbnail handling
+  const thumbKeys = [...new Set([...byCard.values()].map((e) => thumbStorageKey(e.id)))];
+  let thumbData;
+  try {
+    thumbData = await browser.storage.local.get(thumbKeys);
+  } catch {
+    thumbData = {};
+  }
+
+  const thumbsToSet = {};
+  for (const { id, card } of byCard.values()) {
+    const thumbEl = card.querySelector('ytd-thumbnail');
+    if (!thumbEl) continue;
+
+    const k = thumbStorageKey(id);
+    const raw = thumbData[k];
+    let pin = null;
+    if (raw && typeof raw === 'string' && raw.includes('ytimg.com')) {
+      pin = raw;
+    }
+
+    if (pin !== null) {
+      const current = extractThumbnailUrl(thumbEl);
+      if (current !== pin) {
+        setPinnedThumbnail(thumbEl, pin);
+      }
+    } else {
+      const t = extractThumbnailUrl(thumbEl);
+      if (t) {
+        thumbsToSet[k] = t;
+        thumbData[k] = t;
+      }
+    }
+  }
+
+  if (Object.keys(thumbsToSet).length > 0) {
+    try {
+      await browser.storage.local.set(thumbsToSet);
     } catch {
       /* ignore */
     }

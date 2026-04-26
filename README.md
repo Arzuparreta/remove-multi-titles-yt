@@ -3,21 +3,22 @@
 
 [**Get for Firefox**](https://addons.mozilla.org/en-US/firefox/addon/remove-multi-titles-youtube) | [**Get for Chrome**](https://chromewebstore.google.com/detail/remove-multi-titles-youtu/gahcfhkfmbmfbmchbcepecigldgokkif)
 
-YouTube sometimes A/B tests different titles for the same video. This extension remembers the first title you see for each video and keeps showing that one in the player and in lists (home, subscriptions, search results, related videos, etc.), so you are not bounced between variants or re-clickbaited by a renamed tile.
+YouTube sometimes A/B tests different titles and thumbnails for the same video. This extension remembers the first title and thumbnail you see for each video and keeps showing that one in the player and in lists (home, subscriptions, search results, related videos, etc.), so you are not bounced between variants or re-clickbaited by a renamed tile.
 
-It only runs on youtube.com. Thumbnails are unchanged; only title text is adjusted where the extension can match a video to a stored title.
+It only runs on youtube.com.
 
-## How it works 
+## How it works
 
-The first time you see a title for a video (watch page, Shorts, or a grid tile), it is saved locally. Later, that same string is shown again for that video id. Updates run **after navigation** (`yt-navigate-finish`, URL changes) with a few short retries so metadata can mount — there is **no** continuous MutationObserver on the big watch title, which avoided fighting YouTube’s UI. Nothing is sent to a server.
+The first time you see a title and thumbnail for a video (watch page, Shorts, or a grid tile), they are saved locally. Later, those same strings are shown again for that video id. Updates run **after navigation** (`yt-navigate-finish`, URL changes) with a few short retries so metadata can mount — there is **no** continuous MutationObserver on the big watch title or thumbnail, which avoided fighting YouTube’s UI. Nothing is sent to a server.
 
-## Architecture 
+## Architecture
 
 | Area | Behaviour |
 |------|-----------|
-| Watch / Shorts | Apply pin or save first-seen **once per navigation**, with bounded retries (`PLAYER_RETRY_MS`), not a live DOM fight. |
-| Lists / grids | Debounced subtree observers on `#contents`, miniplayer, Shorts, and `#primary-inner` (not `#secondary`) so sidebar churn does not constantly re-run pin passes. Sidebar tiles are still included when locks run (navigation, history message, other roots). |
+| Watch / Shorts | Apply pin or save first-seen **once per navigation**, with bounded retries (`PLAYER_RETRY_MS`), not a live DOM fight. Applies to both titles and thumbnails. |
+| Lists / grids | Debounced subtree observers on `#contents`, miniplayer, Shorts, and `#primary-inner` (not `#secondary`) so sidebar churn does not constantly re-run pin passes. Sidebar tiles are still included when locks run (navigation, history message, other roots). Applies to both titles and thumbnails. |
 | Video id | YouTube `yt-navigate-finish` detail when present; otherwise URL (`?v=` / Shorts path). |
+| Storage | Uses `browser.storage.local` with `ytTitleLock:` prefix for titles and `ytThumbLock:` prefix for thumbnails. |
 
 ### Install from source (Chrome / Chromium)
 
