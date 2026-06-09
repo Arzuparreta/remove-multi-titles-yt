@@ -27,26 +27,30 @@ This is a browser extension that pins the first-seen title and thumbnail per You
 ## Architecture
 
 ### Core Design Philosophy
-The extension avoids fighting YouTube's UI by not attaching continuous MutationObservers to the watch title or thumbnail area. Instead, it applies title and thumbnail pins once per navigation with bounded retries, and uses debounced subtree observers for grid lists.
+The extension avoids fighting YouTube's UI by not attaching continuous MutationObservers to the watch title. Instead, it reacts to YouTube's own page events (`yt-page-data-updated`, `yt-navigate-finish`) with a small bounded-retry safety net for the watch player, and uses debounced subtree observers for grid lists. A single reconciliation engine (`reconcileTarget`) decides "apply the pin" vs "learn the native value" for every surface, so titles and thumbnails are handled homogeneously.
 
 ### Key Components
 
 **content.js** - Main extension logic:
-- **Watch/Shorts handling**: Applies title and thumbnail pin or saves first-seen title and thumbnail once per navigation using `PLAYER_RETRY_MS` delays (0, 150, 400, 900ms)
-- **Grid/List handling**: Debounced subtree observers on `#contents`, miniplayer, Shorts, and `#primary-inner` (excludes `#secondary` to avoid constant re-runs from sidebar churn)
-- **Video ID extraction**: Prefers YouTube's `yt-navigate-finish` event detail, falls back to URL parsing (`?v=` or Shorts path)
-- **Title text updates**: Mutates text nodes in place (including open shadow subtrees) rather than assigning `textContent`, which preserves internal structure and layout
-- **Thumbnail updates**: Updates thumbnail URLs by modifying `img` src attributes or `background-image` CSS properties
+- **Storage layer**: One unified record per video, `ytPin:<id> = { t, th, ts }` (title, thumbnail URL, last-write epoch), accessed via `getPins`/`commitPins` (one round-trip each). `mergeRecord` keeps the untouched field on partial writes.
+- **Reconciliation engine**: `reconcileTarget({ videoId, titleEl, thumbEl }, record, opts)` is the only place that pins or learns. Watch passes `thumbEl: null` (the player occupies that space) and an `expectTitle` guard; grid passes both.
+- **Watch/Shorts handling (`applyPlayer`)**: Runs on page events with a generation guard (`playerApplyGen`) + URL re-check so a stale apply never writes after navigation. Learns a title only when the DOM matches `document.title` (settled), except on the final `PLAYER_RETRY_MS` attempt.
+- **Grid/List handling (`applyGridLocks`)**: Debounced subtree observers on `#contents`, miniplayer, Shorts, and `#primary-inner` (excludes `#secondary`). Captures the id per card at scan time and **re-verifies** `cardVideoId(card)` right before writing (YouTube recycles card DOM during scroll). A `WeakMap` skip cache drops already-reconciled, unchanged cards before the storage read.
+- **Video ID extraction**: Prefers YouTube's `yt-navigate-finish` event detail, falls back to URL parsing (`?v=` or Shorts path).
+- **Title text updates**: Mutates text nodes in place (including open shadow subtrees) rather than assigning `textContent`.
+- **LRU pruning**: After ~`PRUNE_CHECK_EVERY` newly learned records, `selectKeysToEvict` trims storage back to `PIN_MAX` by oldest `ts`.
+- **Migration**: One-time fold of legacy `ytTitleLock:` / `ytThumbLock:` keys into `ytPin:` records, gated by `ytPinSchema`; apply passes `await migrationReady`.
 
 **background.js** - Minimal background script (Firefox) or service worker (Chrome) for extension lifecycle
 
 ### Important Constants
-- `STORAGE_PREFIX: "ytTitleLock:"` - Storage key prefix for titles
-- `THUMB_STORAGE_PREFIX: "ytThumbLock:"` - Storage key prefix for thumbnails
+- `PIN_PREFIX: "ytPin:"` - Storage key prefix for the unified per-video record
+- `PIN_MAX: 5000` - LRU cap on stored video records
+- `PRUNE_CHECK_EVERY: 200` - Newly learned records before a prune scan runs
 - `GRID_DEBOUNCE_MS: 300` - Debounce delay for grid list mutations
 - `GRID_RESYNC_DEBOUNCE_MS: 800` - Delay for resyncing observers after layout changes
-- `NAV_APPLY_DEBOUNCE_MS: 64` - Debounce for navigation-based title and thumbnail application
-- `PLAYER_RETRY_MS: [0, 150, 400, 900]` - Retry timings for watch/Shorts title and thumbnail application
+- `NAV_APPLY_DEBOUNCE_MS: 64` - Debounce for navigation-based title application
+- `PLAYER_RETRY_MS: [0, 300]` - Bounded safety-net retries for watch/Shorts (primary trigger is events)
 - `GRID_SCAN_CAP: 800` - Maximum grid anchors to scan per pass
 
 ### Observer Strategy
@@ -66,20 +70,27 @@ E2E tests use Playwright with Chromium loading the extension as unpacked. Tests 
 1. **Round-trip** - First title seen is shown again after full navigation
 2. **Same-page stability** - Watch title text remains unchanged across several seconds
 3. **SPA navigation** - In-page navigation shows different titles for different videos
-4. **Thumbnail round-trip** - First thumbnail seen is shown again after full navigation
-5. **Thumbnail same-page stability** - Watch thumbnail remains unchanged across several seconds
-6. **Thumbnail SPA navigation** - In-page navigation shows different thumbnails for different videos
+4. **Grid thumbnail round-trip** - First thumbnail seen for a grid/sidebar card is shown again after full navigation
+5. **Grid thumbnail SPA navigation** - In-page navigation shows different thumbnails for different videos
+
+(Watch pages pin the title only — the player occupies the thumbnail area.)
+
+Pure helpers in `content.js` are also covered by fast `node:test` unit tests (`npm run test:unit`): title/thumbnail validation, video-id extraction, record merge, and LRU eviction.
 
 Tests require headed browser (extensions don't load in headless mode). For CI, use Xvfb or `npm run test:e2e:ci`.
 
 ## Important Constraints
 
-- **No continuous observers on watch title or thumbnail**: Avoids fighting YouTube's UI and prevents stuck/flickering titles and thumbnails
+- **No continuous observers on watch title**: React to `yt-page-data-updated` / `yt-navigate-finish` events (not a live observer) to avoid fighting YouTube's UI and prevent stuck/flickering titles
+- **Generation guards**: Both `applyPlayer` and `applyGridLocks` bump a generation counter and bail if a newer pass started during their `await`; `applyPlayer` also re-checks the URL still matches the captured id
+- **Grid recycling guard**: Re-verify `cardVideoId(card) === capturedId` before writing, because YouTube reuses card DOM nodes for different videos during virtualized scroll
+- **Learn-when-settled (watch)**: Only save a native title that matches `document.title`, so the previous video's title is never pinned under the new id
 - **Exclude #secondary from subtree observers**: Sidebar recommendations mutate constantly; sidebar tiles are still scanned when grid locks run via other triggers
 - **Text node mutation**: Updates text nodes directly rather than replacing `textContent` to preserve component structure
-- **Thumbnail URL updates**: Updates `img` src attributes or `background-image` CSS properties directly
-- **Storage prefix**: Title keys use `ytTitleLock:` prefix, thumbnail keys use `ytThumbLock:` prefix
+- **No watch-page thumbnail pin**: The player occupies that area; thumbnails are pinned only in grids/sidebar
+- **Storage record**: One `ytPin:<id> = { t, th, ts }` record per video; LRU-pruned to `PIN_MAX`
 - **Video ID validation**: Uses regex `/[a-zA-Z0-9_-]{11}/` for YouTube video IDs
+- **Unit tests**: Pure helpers are exported from `content.js` under a `module.exports` guard and tested via `npm run test:unit` (`node:test`)
 
 ## Store Submission
 

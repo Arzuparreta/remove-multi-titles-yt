@@ -15,10 +15,10 @@ The first time you see a title and thumbnail for a video (watch page, Shorts, or
 
 | Area | Behaviour |
 |------|-----------|
-| Watch / Shorts | Apply pin or save first-seen **once per navigation**, with bounded retries (`PLAYER_RETRY_MS`), not a live DOM fight. Applies to both titles and thumbnails. |
-| Lists / grids | Debounced subtree observers on `#contents`, miniplayer, Shorts, and `#primary-inner` (not `#secondary`) so sidebar churn does not constantly re-run pin passes. Sidebar tiles are still included when locks run (navigation, history message, other roots). Applies to both titles and thumbnails. |
+| Watch / Shorts | Pins the **title** on YouTube's own settle signals (`yt-page-data-updated`, `yt-navigate-finish`) with a generation guard + URL re-check, plus a small bounded retry safety net (`PLAYER_RETRY_MS`). A title is only *learned* once the DOM matches `document.title`, so a stale title can't be saved under the wrong video. (The watch player shows the video itself, so no thumbnail is pinned there.) |
+| Lists / grids | Debounced subtree observers on `#contents`, miniplayer, Shorts, and `#primary-inner` (not `#secondary`) so sidebar churn does not constantly re-run pin passes. Sidebar tiles are still included when locks run. Cards are re-verified against their current video id right before writing (YouTube recycles card DOM during scroll), and a per-card skip cache avoids redundant work. Pins both titles and thumbnails. |
 | Video id | YouTube `yt-navigate-finish` detail when present; otherwise URL (`?v=` / Shorts path). |
-| Storage | Uses `browser.storage.local` with `ytTitleLock:` prefix for titles and `ytThumbLock:` prefix for thumbnails. |
+| Storage | `browser.storage.local`, one record per video: `ytPin:<id> = { t, th, ts }` (title, thumbnail URL, last-write time). LRU-pruned to `PIN_MAX` (5000) videos. Legacy `ytTitleLock:` / `ytThumbLock:` keys are migrated once on upgrade. |
 
 ### Install from source (Chrome / Chromium)
 

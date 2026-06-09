@@ -6,6 +6,7 @@
     "build:chrome-unpacked": "node scripts/sync-chrome-unpacked.mjs",
     "build:chrome-zip": "npm run build:chrome-unpacked && python3 scripts/zip-chrome-unpacked.py",
     "build:icons": "python3 scripts/generate-icons.py assets/extension-icon-source.jpg -o icons",
+    "test:unit": "node --test \"tests/unit/**/*.test.js\"",
     "build:amo": "web-ext build",
     "lint:ext": "web-ext lint",
     "postinstall": "playwright install chromium",
