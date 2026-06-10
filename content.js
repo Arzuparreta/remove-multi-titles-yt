@@ -16,6 +16,10 @@
  *   - Grid cards are recycled by YouTube during virtualized scroll / SPA navigation. We capture
  *     the id at scan time and RE-VERIFY the card still maps to that id right before writing
  *     (after the async storage read), skipping recycled cards.
+ *   - Grid learning is gated by a 2-pass tentative check: a (card, id) pair must be observed
+ *     twice with matching (title text, thumb url) across TENTATIVE_SETTLE_MS before it is
+ *     committed to storage. This catches the case where the anchor href is updated first and
+ *     the title text / thumb image are still the previous video's values.
  *
  * Performance:
  *   - One storage.get per grid pass (the unified record carries title + thumbnail).
@@ -90,6 +94,14 @@ let navApplyTimer = 0;
 let lastGridLayoutRoots = null;
 /** Skip cache: card element -> last reconciled { id, t, th } so stable cards are skipped. */
 const gridCardCache = typeof WeakMap !== "undefined" ? new WeakMap() : null;
+/** Tentative store for the 2-pass grid learning gate. Holds the first observed
+ *  native (t, th) for a (card, id) pair so a stale value — produced when YouTube
+ *  recycles a card and updates the anchor href before the title text/thumbnail
+ *  image — is not persisted until a second pass confirms the values are stable. */
+const gridTentative = typeof WeakMap !== "undefined" ? new WeakMap() : null;
+let tentativeVerifyTimer = 0;
+/** Minimum ms between first observation of a (card, id) and the verification pass. */
+const TENTATIVE_SETTLE_MS = 750;
 let learnedSincePruneCheck = 0;
 /** Resolves once legacy keys are migrated; apply passes await it. */
 let migrationReady = Promise.resolve();
@@ -694,6 +706,16 @@ function scheduleApplyGridLocks() {
   }, GRID_DEBOUNCE_MS);
 }
 
+/** Re-run a grid pass after TENTATIVE_SETTLE_MS so freshly recorded tentative
+ *  entries are verified (or reset) before they can be committed to storage. */
+function scheduleTentativeVerification() {
+  if (tentativeVerifyTimer) return;
+  tentativeVerifyTimer = setTimeout(() => {
+    tentativeVerifyTimer = 0;
+    void applyGridLocks();
+  }, TENTATIVE_SETTLE_MS);
+}
+
 /** True when a card already matches its cached reconciled state (so it can be skipped). */
 function cardIsStable(card, id, titleEl, thumbEl) {
   if (!gridCardCache) return false;
@@ -745,9 +767,52 @@ async function applyGridLocks() {
   const patches = new Map();
   for (const tgt of need) {
     // Recycling guard: the card may have been reused for another video during the await.
-    if (cardVideoId(tgt.card) !== tgt.id) continue;
+    // Also clears any tentative entry left over from the previous id.
+    if (cardVideoId(tgt.card) !== tgt.id) {
+      gridTentative?.delete(tgt.card);
+      continue;
+    }
 
     const rec = records.get(tgt.id) || null;
+    const hasPin = !!rec && (isValidTitle(rec.t) || isValidThumb(rec.th));
+
+    if (!hasPin && gridTentative) {
+      // 2-pass gate: a card with no pin must be observed twice with stable
+      // (t, th) values across TENTATIVE_SETTLE_MS before we learn them. This
+      // prevents persisting a stale value from a recycled card whose anchor
+      // href has been updated but whose title text / thumbnail image has not
+      // yet been written by YouTube.
+      const nowT = currentTitleText(tgt.titleEl);
+      const nowTh = tgt.thumbEl ? extractThumbnailUrl(tgt.thumbEl) : null;
+      const t = gridTentative.get(tgt.card);
+
+      if (!t || t.id !== tgt.id) {
+        gridTentative.set(tgt.card, {
+          id: tgt.id,
+          t: nowT,
+          th: nowTh,
+          ts: Date.now(),
+        });
+        scheduleTentativeVerification();
+        continue;
+      }
+      if (Date.now() - t.ts < TENTATIVE_SETTLE_MS) {
+        continue;
+      }
+      if (nowT !== t.t || nowTh !== t.th) {
+        gridTentative.set(tgt.card, {
+          id: tgt.id,
+          t: nowT,
+          th: nowTh,
+          ts: Date.now(),
+        });
+        scheduleTentativeVerification();
+        continue;
+      }
+      // Settled. Drop the tentative and fall through to learn + commit.
+      gridTentative.delete(tgt.card);
+    }
+
     const patch = reconcileTarget(
       { videoId: tgt.id, titleEl: tgt.titleEl, thumbEl: tgt.thumbEl },
       rec
@@ -757,10 +822,20 @@ async function applyGridLocks() {
       patches.set(tgt.id, prev ? { ...prev, ...patch } : patch);
     }
 
-    if (gridCardCache) {
-      const pinnedT = rec && isValidTitle(rec.t) ? normalizeTitle(rec.t) : patch?.t || null;
-      const pinnedTh = rec && isValidThumb(rec.th) ? rec.th : patch?.th || null;
-      gridCardCache.set(tgt.card, { id: tgt.id, t: pinnedT, th: pinnedTh });
+    // Cache safety: only populate gridCardCache with values that already
+    // exist in storage. A freshly learned (patch.*) value may still be wrong
+    // (e.g. stale due to a later update we have not observed), and writing
+    // it to the cache would make cardIsStable return true and block any
+    // future re-reconciliation. Require both fields to be pinned so a
+    // partial pin does not hide ongoing learning of the missing field.
+    if (hasPin && gridCardCache) {
+      if (isValidTitle(rec.t) && (!tgt.thumbEl || isValidThumb(rec.th))) {
+        gridCardCache.set(tgt.card, {
+          id: tgt.id,
+          t: normalizeTitle(rec.t),
+          th: rec.th,
+        });
+      }
     }
   }
 
@@ -863,5 +938,6 @@ if (typeof module !== "undefined" && module.exports) {
     expectedTitleFromDocument,
     PIN_PREFIX,
     PIN_MAX,
+    TENTATIVE_SETTLE_MS,
   };
 }

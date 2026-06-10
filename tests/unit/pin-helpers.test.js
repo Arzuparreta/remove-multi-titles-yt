@@ -16,6 +16,7 @@ const {
   mergeRecord,
   selectKeysToEvict,
   PIN_PREFIX,
+  TENTATIVE_SETTLE_MS,
 } = require(path.resolve(__dirname, "..", "..", "content.js"));
 
 test("normalizeTitle collapses whitespace and trims", () => {
@@ -98,4 +99,14 @@ test("selectKeysToEvict returns oldest keys over the cap, none when under", () =
   // cap of 1 keeps newest (ts 30 => 'a'), evicts the two oldest (b=10, c=20)
   const evicted = selectKeysToEvict(all, 1);
   assert.deepEqual(evicted.sort(), [`${PIN_PREFIX}b`, `${PIN_PREFIX}c`].sort());
+});
+
+test("TENTATIVE_SETTLE_MS is at least the grid debounce so the 2-pass gate can settle", () => {
+  // GRID_DEBOUNCE_MS lives in content.js (300). The 2-pass verification timer
+  // must run after the debounce, otherwise it can re-read a card that has
+  // not yet finished YouTube's DOM update. Keep this a hard lower bound.
+  assert.ok(
+    typeof TENTATIVE_SETTLE_MS === "number" && TENTATIVE_SETTLE_MS >= 300,
+    `TENTATIVE_SETTLE_MS must be a number >= 300 (got ${TENTATIVE_SETTLE_MS})`
+  );
 });

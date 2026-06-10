@@ -24,7 +24,11 @@ module.exports = defineConfig({
   projects: [
     {
       name: "with-extension",
-      testMatch: ["**/multi-title-pin.spec.js", "**/sidebar-thumb-nav-debug.spec.js"],
+      testMatch: [
+        "**/multi-title-pin.spec.js",
+        "**/sidebar-thumb-nav-debug.spec.js",
+        "**/search-recycle.spec.js",
+      ],
       use: {
         ...chromeDesktop,
         launchOptions: {
