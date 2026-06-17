@@ -1,38 +1,27 @@
 /**
- * Pins the first-seen title and thumbnail per YouTube video (watch, Shorts, grid cards)
- * to prevent A/B-test flicker.
+ * Pins the first-seen title and thumbnail per YouTube video to prevent
+ * A/B-test flicker.
  *
- * One engine, applied homogeneously to watch/Shorts and grid lists:
- *   - Storage: a single record per video, `ytPin:<id> = { t, th, ts }` (title, thumbUrl,
- *     last-write epoch). Reads/writes go through getPins/commitPins (one round-trip each).
- *   - reconcileTarget({ videoId, titleEl, thumbEl }, record, opts) is the only place that
- *     decides "apply the pin" vs "learn the native value". Both surfaces call it.
+ * Strategy: intercept YouTube's InnerTube API responses (fetch) and the
+ * initial page data (ytInitialData / ytInitialPlayerResponse) to capture
+ * (videoId, title, thumbnailUrl) tuples before YouTube renders them.
  *
- * Reliability (avoids "wrong title stuck on a different video"):
- *   - Watch/Shorts run on YouTube's own settle signals (yt-page-data-updated, yt-navigate-finish)
- *     with a generation guard + URL re-check, so a stale apply can never write after navigation.
- *     When learning we also require the native title to match document.title (the video has
- *     actually settled) before saving it.
- *   - Grid cards are recycled by YouTube during virtualized scroll / SPA navigation. We capture
- *     the id at scan time and RE-VERIFY the card still maps to that id right before writing
- *     (after the async storage read), skipping recycled cards.
- *   - Grid learning is gated by a 2-pass tentative check: a (card, id) pair must be observed
- *     twice with matching (title text, thumb url) across TENTATIVE_SETTLE_MS before it is
- *     committed to storage. This catches the case where the anchor href is updated first and
- *     the title text / thumb image are still the previous video's values.
+ * An in-memory pin cache (loaded from storage on startup) lets us apply
+ * pinned values synchronously inside the fetch interception — modifying
+ * the JSON object before YouTube's code ever reads it.  We return a new
+ * Response with the modified body so YouTube renders the pinned version
+ * directly.  No DOM observers, no recycling races, no tentative gates.
  *
- * Performance:
- *   - One storage.get per grid pass (the unified record carries title + thumbnail).
- *   - A WeakMap<card> skip cache: cards already reconciled (same id, text/thumb already match)
- *     are dropped before the storage read, so steady-state scroll does almost no work.
- *   - Bounded TreeWalker scan (GRID_SCAN_CAP), comments/chat and player subtree rejected.
+ * XHR interception is learn-only (we cannot reliably replace XHR response
+ * bodies); a lightweight DOM fallback handles those rare cases.
  *
- * Compatibility: title text is updated by mutating text nodes in place (incl. open shadow
- * subtrees) instead of assigning textContent, which preserves component structure. We do not
- * attach MutationObservers to the watch title (yt-page-data-updated is an event, not a
- * continuous observer) nor to #secondary (it churns constantly and can race YouTube's SPA
- * click handler); sidebar tiles are still scanned when grid passes run.
+ * Storage: one record per video, `ytPin:<id> = { t, th, ts }`.
+ * LRU-pruned to PIN_MAX.
  */
+
+/* ------------------------------------------------------------------ *
+ * Constants
+ * ------------------------------------------------------------------ */
 
 const PIN_PREFIX = "ytPin:";
 const SCHEMA_KEY = "ytPinSchema";
@@ -40,74 +29,45 @@ const SCHEMA_VERSION = 2;
 const LEGACY_TITLE_PREFIX = "ytTitleLock:";
 const LEGACY_THUMB_PREFIX = "ytThumbLock:";
 
-/** LRU cap on stored video records; pruned back to this when exceeded. */
 const PIN_MAX = 5000;
-/** Run the (full-scan) prune check only after this many newly learned records. */
 const PRUNE_CHECK_EVERY = 200;
 
 const YT_ID_RE = /[a-zA-Z0-9_-]{11}/;
-const GRID_DEBOUNCE_MS = 300;
-const GRID_RESYNC_DEBOUNCE_MS = 800;
-const NAV_APPLY_DEBOUNCE_MS = 64;
-/** Safety net only; primary watch detection is event-driven (yt-page-data-updated). */
-const PLAYER_RETRY_MS = [0, 300];
+const YT_API_RE = /\/youtubei\/v1\/([^?]+)/;
 
-/** Subtree observers: exclude #secondary (see file comment). */
-const GRID_OBSERVER_ROOT_SELECTORS = ["#contents", "ytd-miniplayer", "ytd-shorts"];
+/** DOM fallback debounce (apply-only, no learning). */
+const DOM_FALLBACK_DEBOUNCE_MS = 300;
+/** Minimum ms between storage commits after learning new entries. */
+const COMMIT_DEBOUNCE_MS = 500;
+/** Max entries to scan per DOM pass. */
+const DOM_SCAN_CAP = 400;
 
-/** Anchor scan roots: #secondary first so cap still covers watch sidebar when #contents is huge. */
-const GRID_SCAN_ROOT_SELECTORS = ["#secondary", "#contents", "ytd-miniplayer", "ytd-shorts"];
+/** Legacy constant — kept for unit-test compatibility with the old 2-pass gate. */
+const TENTATIVE_SETTLE_MS = 750;
 
-const GRID_CARD_TAGS = new Set([
-  "YTD-RICH-ITEM-RENDERER",
-  "YTD-VIDEO-RENDERER",
-  "YTD-GRID-VIDEO-RENDERER",
-  "YTD-COMPACT-VIDEO-RENDERER",
-  "YTD-RICH-GRID-MEDIA",
-  "YTD-REEL-ITEM-RENDERER",
-  "YTD-MOVIE-RENDERER",
-  "YTD-PLAYLIST-VIDEO-RENDERER",
-  "YTD-CHANNEL-VIDEO-RENDERER",
-  "YTD-PLAYLIST-PANEL-VIDEO-RENDERER",
-]);
-
-const GRID_SCAN_CAP = 800;
+// --- state ---
 
 /**
- * Under #primary-inner only: skip comments/live chat in TreeWalker scans and in the
- * subtree observer filter so heavy comment/chat DOM does not schedule grid passes.
+ * In-memory pin cache: Map<videoId, {t, th, ts}>.
+ * Loaded from storage on startup, kept in sync via storage.onChanged.
+ * This lets us apply pins SYNCHRONOUSLY inside fetch/initial-data traps.
  */
-const PRIMARY_INNER_IGNORE_SEL =
-  "ytd-comments, #comments, ytd-live-chat-renderer, #chat";
+const pinCache = new Map();
+/** Resolves when the cache has been fully loaded from storage. */
+let pinCacheResolve;
+const pinCacheReady = new Promise((r) => { pinCacheResolve = r; });
+let cacheLoaded = false;
 
-const GRID_LINK_IN_CARD_SEL = 'a[href*="watch?v="], a[href*="/shorts/"]';
-const THUMB_IMG_SEL = 'img[src*="ytimg.com"]';
-
-let gridSubtreeObservers = [];
-let gridAppStructureObserver = null;
-let gridResyncTimer = null;
-let gridDebounceTimer = null;
-let gridApplyGen = 0;
-let playerApplyGen = 0;
-let navApplyTimer = 0;
-/** @type {{ root: Element; filterPrimaryInner: boolean }[] | null} */
-let lastGridLayoutRoots = null;
-/** Skip cache: card element -> last reconciled { id, t, th } so stable cards are skipped. */
-const gridCardCache = typeof WeakMap !== "undefined" ? new WeakMap() : null;
-/** Tentative store for the 2-pass grid learning gate. Holds the first observed
- *  native (t, th) for a (card, id) pair so a stale value — produced when YouTube
- *  recycles a card and updates the anchor href before the title text/thumbnail
- *  image — is not persisted until a second pass confirms the values are stable. */
-const gridTentative = typeof WeakMap !== "undefined" ? new WeakMap() : null;
-let tentativeVerifyTimer = 0;
-/** Minimum ms between first observation of a (card, id) and the verification pass. */
-const TENTATIVE_SETTLE_MS = 750;
+/** Entries learned this session that haven't been flushed to storage yet. */
+const pendingWrites = new Map();
+let commitTimer = null;
 let learnedSincePruneCheck = 0;
-/** Resolves once legacy keys are migrated; apply passes await it. */
+
+let domFallbackTimer = null;
 let migrationReady = Promise.resolve();
 
 /* ------------------------------------------------------------------ *
- * Pure helpers (no DOM / no storage) — also exported for unit tests.
+ * Pure helpers (no DOM / no storage).
  * ------------------------------------------------------------------ */
 
 function normalizeTitle(s) {
@@ -124,7 +84,6 @@ function looksLikeTimestampOrDuration(s) {
   return false;
 }
 
-/** A title worth pinning/learning: non-empty, not "undefined", not a bare timestamp. */
 function isValidTitle(s) {
   if (s === undefined || s === null) return false;
   const t = normalizeTitle(String(s));
@@ -133,7 +92,6 @@ function isValidTitle(s) {
   return true;
 }
 
-/** A thumbnail worth pinning/learning: a YouTube image URL. */
 function isValidThumb(s) {
   return typeof s === "string" && s.includes("ytimg.com");
 }
@@ -142,7 +100,6 @@ function pinKey(id) {
   return `${PIN_PREFIX}${id}`;
 }
 
-/** Merge a learned patch ({ t?, th? }) into a prior record, refreshing the LRU timestamp. */
 function mergeRecord(prev, patch) {
   const next = {
     t: prev && typeof prev.t === "string" ? prev.t : null,
@@ -154,7 +111,6 @@ function mergeRecord(prev, patch) {
   return next;
 }
 
-/** Oldest ytPin keys to evict so the count returns to `max` (empty if under cap). */
 function selectKeysToEvict(allObj, max) {
   const entries = [];
   for (const k in allObj) {
@@ -164,7 +120,7 @@ function selectKeysToEvict(allObj, max) {
     entries.push([k, ts]);
   }
   if (entries.length <= max) return [];
-  entries.sort((a, b) => a[1] - b[1]); // oldest first
+  entries.sort((a, b) => a[1] - b[1]);
   return entries.slice(0, entries.length - max).map((e) => e[0]);
 }
 
@@ -225,59 +181,63 @@ function extractVideoIdFromYtNavigateDetail(detail) {
 }
 
 /* ------------------------------------------------------------------ *
- * Storage layer (single unified record per video).
+ * Pin cache — in-memory, kept in sync with storage.
  * ------------------------------------------------------------------ */
 
-/** @returns {Promise<Map<string, {t:string|null, th:string|null, ts:number}>>} */
-async function getPins(ids) {
-  const map = new Map();
-  if (!ids || ids.length === 0) return map;
-  const keys = ids.map(pinKey);
-  let data;
-  try {
-    data = await browser.storage.local.get(keys);
-  } catch {
-    return map;
-  }
-  for (const id of ids) {
-    const rec = data[pinKey(id)];
-    if (rec && typeof rec === "object") map.set(id, rec);
-  }
-  return map;
-}
-
-/**
- * Write learned patches. `patches` is Map<id, {t?, th?}>, `records` is the Map<id, record>
- * already read this pass (so we merge instead of clobbering the other field).
- */
-async function commitPins(patches, records) {
-  if (!patches || patches.size === 0) return;
-  const writes = {};
-  for (const [id, patch] of patches) {
-    writes[pinKey(id)] = mergeRecord(records.get(id) || null, patch);
-  }
-  try {
-    await browser.storage.local.set(writes);
-  } catch {
-    return;
-  }
-  void notePrune(patches.size);
-}
-
-async function notePrune(n) {
-  learnedSincePruneCheck += n;
-  if (learnedSincePruneCheck < PRUNE_CHECK_EVERY) return;
-  learnedSincePruneCheck = 0;
+/** Load the full cache from storage (called once on startup). */
+async function loadPinCache() {
   try {
     const all = await browser.storage.local.get(null);
-    const toRemove = selectKeysToEvict(all, PIN_MAX);
-    if (toRemove.length) await browser.storage.local.remove(toRemove);
+    for (const k of Object.keys(all)) {
+      if (!k.startsWith(PIN_PREFIX)) continue;
+      const rec = all[k];
+      if (rec && typeof rec === "object" && (rec.t || rec.th)) {
+        pinCache.set(k.slice(PIN_PREFIX.length), rec);
+      }
+    }
   } catch {
     /* ignore */
   }
 }
 
-/** One-time fold of legacy ytTitleLock:/ytThumbLock: keys into ytPin: records. */
+/** Persist pending writes to storage, debounced. */
+function scheduleCommit() {
+  if (commitTimer) return;
+  commitTimer = setTimeout(() => {
+    commitTimer = null;
+    void flushCommit();
+  }, COMMIT_DEBOUNCE_MS);
+}
+
+async function flushCommit() {
+  const writes = {};
+  for (const [id, patch] of pendingWrites) {
+    const existing = pinCache.get(id);
+    writes[pinKey(id)] = mergeRecord(existing || null, patch);
+  }
+  pendingWrites.clear();
+
+  if (Object.keys(writes).length === 0) return;
+
+  try {
+    await browser.storage.local.set(writes);
+  } catch {
+    return;
+  }
+
+  learnedSincePruneCheck += Object.keys(writes).length;
+  if (learnedSincePruneCheck >= PRUNE_CHECK_EVERY) {
+    learnedSincePruneCheck = 0;
+    try {
+      const all = await browser.storage.local.get(null);
+      const toRemove = selectKeysToEvict(all, PIN_MAX);
+      if (toRemove.length) await browser.storage.local.remove(toRemove);
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
 async function migrateLegacyIfNeeded() {
   try {
     const flag = await browser.storage.local.get(SCHEMA_KEY);
@@ -305,7 +265,6 @@ async function migrateLegacyIfNeeded() {
     }
 
     if (Object.keys(writes).length) {
-      // Don't clobber a ytPin record that already exists for the same id.
       for (const key in writes) {
         const ex = all[key];
         if (ex && typeof ex === "object") {
@@ -323,8 +282,359 @@ async function migrateLegacyIfNeeded() {
 }
 
 /* ------------------------------------------------------------------ *
- * DOM read/write primitives.
+ * JSON walking: extract video entries & apply pins in place.
  * ------------------------------------------------------------------ */
+
+function readTitleFromObj(obj) {
+  if (!obj || typeof obj !== "object") return null;
+
+  if (typeof obj.title === "string" && obj.title) return obj.title;
+  if (obj.title?.runs?.[0]?.text) return obj.title.runs[0].text;
+  if (obj.title?.simpleText) return obj.title.simpleText;
+  if (obj.headline?.simpleText) return obj.headline.simpleText;
+  if (obj.metadata?.lockupMetadataViewModel?.title?.content) {
+    return obj.metadata.lockupMetadataViewModel.title.content;
+  }
+  if (obj.videoPrimaryInfoRenderer?.title?.runs?.[0]?.text) {
+    return obj.videoPrimaryInfoRenderer.title.runs[0].text;
+  }
+  return null;
+}
+
+function writeTitleToObj(obj, text) {
+  if (!obj || typeof obj !== "object" || !text) return false;
+
+  if (typeof obj.title === "string") { obj.title = text; return true; }
+  if (obj.title?.runs?.[0]) { obj.title.runs[0].text = text; return true; }
+  if (obj.title?.simpleText !== undefined) { obj.title.simpleText = text; return true; }
+  if (obj.headline?.simpleText !== undefined) { obj.headline.simpleText = text; return true; }
+  if (obj.metadata?.lockupMetadataViewModel?.title) {
+    obj.metadata.lockupMetadataViewModel.title.content = text;
+    return true;
+  }
+  if (obj.videoPrimaryInfoRenderer?.title?.runs?.[0]) {
+    obj.videoPrimaryInfoRenderer.title.runs[0].text = text;
+    return true;
+  }
+  if (obj.videoDetails?.title) { obj.videoDetails.title = text; return true; }
+  return false;
+}
+
+function readThumbFromObj(obj) {
+  if (!obj || typeof obj !== "object") return null;
+
+  const arr = obj.thumbnail?.thumbnails;
+  if (Array.isArray(arr)) {
+    for (const t of arr) {
+      if (t?.url && t.url.includes("ytimg.com")) return t.url;
+    }
+  }
+
+  const vdArr = obj.videoDetails?.thumbnail?.thumbnails;
+  if (Array.isArray(vdArr)) {
+    for (const t of vdArr) {
+      if (t?.url && t.url.includes("ytimg.com")) return t.url;
+    }
+  }
+
+  const sources = obj.contentImage?.thumbnailViewModel?.image?.sources;
+  if (Array.isArray(sources)) {
+    for (const s of sources) {
+      if (s?.url && s.url.includes("ytimg.com")) return s.url;
+    }
+  }
+
+  return null;
+}
+
+function writeThumbToObj(obj, url) {
+  if (!obj || typeof obj !== "object" || !url) return false;
+
+  const arr = obj.thumbnail?.thumbnails;
+  if (Array.isArray(arr)) { for (const t of arr) t.url = url; return true; }
+
+  const vdArr = obj.videoDetails?.thumbnail?.thumbnails;
+  if (Array.isArray(vdArr)) { for (const t of vdArr) t.url = url; return true; }
+
+  const sources = obj.contentImage?.thumbnailViewModel?.image?.sources;
+  if (Array.isArray(sources)) { for (const s of sources) s.url = url; return true; }
+
+  return false;
+}
+
+function readVideoId(obj) {
+  if (!obj || typeof obj !== "object") return null;
+  if (typeof obj.videoId === "string" && YT_ID_RE.test(obj.videoId)) return obj.videoId;
+  if (obj.videoDetails?.videoId && YT_ID_RE.test(obj.videoDetails.videoId)) return obj.videoDetails.videoId;
+  if (typeof obj.contentId === "string" && YT_ID_RE.test(obj.contentId)) return obj.contentId;
+  return null;
+}
+
+const UNWRAP_KEYS = new Set([
+  "videoRenderer", "compactVideoRenderer", "gridVideoRenderer",
+  "richItemRenderer", "reelItemRenderer", "movieRenderer",
+  "playlistVideoRenderer", "channelVideoRenderer",
+  "playlistPanelVideoRenderer", "lockupViewModel", "shortsLockupViewModel",
+  "content",
+]);
+
+/**
+ * Walk a JSON object recursively and collect every renderer-like node.
+ * Returns { videoId, title, thumbUrl, _obj } for each video found.
+ * The _obj reference lets us modify the original JSON in place.
+ */
+function collectVideoEntries(root, maxEntries) {
+  const out = [];
+  const max = maxEntries || 5000;
+  const visited = new WeakSet();
+
+  function walk(val) {
+    if (out.length >= max) return;
+    if (!val || typeof val !== "object") return;
+    if (visited.has(val)) return;
+    visited.add(val);
+
+    const vid = readVideoId(val);
+    if (vid) {
+      const title = readTitleFromObj(val);
+      const thumbUrl = readThumbFromObj(val);
+      if (title || thumbUrl) {
+        out.push({ videoId: vid, title, thumbUrl, _obj: val });
+      }
+    }
+
+    // Unwrap renderer wrappers to find the inner data
+    for (const k of UNWRAP_KEYS) {
+      const inner = val[k];
+      if (inner && typeof inner === "object") walk(inner);
+    }
+
+    // Walk array / object children (skip already-unwrapped keys)
+    if (Array.isArray(val)) {
+      for (const item of val) walk(item);
+    } else {
+      for (const key of Object.keys(val)) {
+        if (UNWRAP_KEYS.has(key)) continue;
+        const child = val[key];
+        if (child && typeof child === "object") walk(child);
+      }
+    }
+  }
+
+  walk(root);
+  return out;
+}
+
+/* ------------------------------------------------------------------ *
+ * Core: process extracted entries — learn + apply pins synchronously.
+ * ------------------------------------------------------------------ */
+
+/**
+ * Process video entries extracted from a JSON response:
+ * 1. Apply existing pins from the in-memory cache (sync).
+ * 2. Learn new entries for videos not yet in cache (cache update sync;
+ *    storage write async).
+ *
+ * Returns true if any pin was applied (meaning the JSON was modified).
+ */
+function processEntries(entries) {
+  let modified = false;
+  const newlySeen = [];
+
+  for (const e of entries) {
+    const rec = pinCache.get(e.videoId);
+
+    if (rec) {
+      // Pin exists — apply it to the JSON object
+      if (isValidTitle(rec.t) && writeTitleToObj(e._obj, normalizeTitle(rec.t))) {
+        modified = true;
+      }
+      if (isValidThumb(rec.th) && writeThumbToObj(e._obj, rec.th)) {
+        modified = true;
+      }
+    } else {
+      // No pin yet — learn first-seen
+      const patch = {};
+      if (isValidTitle(e.title)) patch.t = normalizeTitle(e.title);
+      if (isValidThumb(e.thumbUrl)) patch.th = e.thumbUrl;
+      if (patch.t || patch.th) {
+        newlySeen.push({ id: e.videoId, patch });
+      }
+    }
+  }
+
+  // Update in-memory cache immediately (sync, so future fetch responses
+  // see the pin).  Storage write is deferred.
+  for (const { id, patch } of newlySeen) {
+    const existing = pinCache.get(id);
+    pinCache.set(id, mergeRecord(existing || null, patch));
+    const prev = pendingWrites.get(id);
+    pendingWrites.set(id, prev ? { ...prev, ...patch } : patch);
+  }
+
+  if (newlySeen.length > 0) scheduleCommit();
+
+  return modified;
+}
+
+/* ------------------------------------------------------------------ *
+ * API interception — fetch.
+ * ------------------------------------------------------------------ */
+
+function isYtApiUrl(str) {
+  return typeof str === "string" && YT_API_RE.test(str);
+}
+
+function getYtEndpoint(str) {
+  const m = str.match(YT_API_RE);
+  return m ? m[1] : "";
+}
+
+function patchFetch() {
+  const _fetch = window.fetch;
+
+  window.fetch = async function (input, init) {
+    const url = typeof input === "string" ? input : input?.url || "";
+
+    const response = await _fetch.call(this, input, init);
+
+    if (!isYtApiUrl(url)) return response;
+
+    const ep = getYtEndpoint(url);
+    if (!/^(player|next|browse|search|reel)/.test(ep)) return response;
+
+    try {
+      const clone = response.clone();
+      const json = await clone.json();
+      const entries = collectVideoEntries(json, 4000);
+
+      if (entries.length === 0) return response;
+
+      // Guard against race: if the cache hasn't loaded yet, wait before
+      // processing — otherwise we could overwrite an existing stored pin
+      // with this response's first-seen value.
+      await pinCacheReady;
+
+      const modified = processEntries(entries);
+
+      if (modified) {
+        // Return a new Response with the pinned values baked in.
+        // YouTube's code reads this modified body instead of the original.
+        return new Response(JSON.stringify(json), {
+          status: response.status,
+          statusText: response.statusText,
+          headers: response.headers,
+        });
+      }
+    } catch {
+      /* clone/parse failure is non-fatal */
+    }
+
+    return response;
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * API interception — XHR (learn-only; unreliable to modify responses).
+ * ------------------------------------------------------------------ */
+
+function patchXHR() {
+  const XHRProto = XMLHttpRequest.prototype;
+  const _open = XHRProto.open;
+  const _send = XHRProto.send;
+
+  XHRProto.open = function (method, url) {
+    this.__ytUrl = typeof url === "string" ? url : url?.toString?.() || "";
+    return _open.apply(this, arguments);
+  };
+
+  XHRProto.send = function () {
+    const url = this.__ytUrl;
+    if (isYtApiUrl(url)) {
+      const ep = getYtEndpoint(url);
+      if (/^(player|next|browse|search|reel)/.test(ep)) {
+        this.addEventListener("readystatechange", function handler() {
+          if (this.readyState === XMLHttpRequest.DONE && this.status === 200) {
+            try {
+              const json = JSON.parse(this.responseText);
+              const entries = collectVideoEntries(json, 4000);
+              if (entries.length > 0) {
+                // We cannot await inside a synchronous event handler,
+                // but pinCacheReady is almost certainly resolved by now
+                // (the first XHR call fires long after JS initialization).
+                // Queue the processing microtask-style.
+                void pinCacheReady.then(() => {
+                  processEntries(entries);
+                  scheduleDomFallback();
+                });
+              }
+            } catch {
+              /* ignore */
+            }
+          }
+        });
+      }
+    }
+    return _send.apply(this, arguments);
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * Initial data traps — intercept ytInitialData / ytInitialPlayerResponse
+ * assignment on full-page loads before YouTube processes them.
+ * ------------------------------------------------------------------ */
+
+function trapWindowProperty(name) {
+  let stored = undefined;
+  Object.defineProperty(window, name, {
+    configurable: true,
+    enumerable: true,
+    get() {
+      return stored;
+    },
+    set(v) {
+      stored = v;
+      if (v && typeof v === "object") {
+        if (cacheLoaded) {
+          const entries = collectVideoEntries(v, 4000);
+          processEntries(entries);
+        } else {
+          // Cache not loaded yet — defer to avoid overwriting existing pins.
+          // The DOM fallback will apply pins once the cache is ready.
+          void pinCacheReady.then(() => {
+            const entries = collectVideoEntries(v, 4000);
+            processEntries(entries);
+          });
+        }
+      }
+    },
+  });
+}
+
+function installInitialDataTraps() {
+  if (!("ytInitialData" in window)) trapWindowProperty("ytInitialData");
+  if (!("ytInitialPlayerResponse" in window)) trapWindowProperty("ytInitialPlayerResponse");
+}
+
+/* ------------------------------------------------------------------ *
+ * DOM fallback (apply-only, never learns).
+ *
+ * Handles the rare case where XHR responses were not modified and
+ * YouTube's DOM still shows the native title/thumbnail.
+ * ─────────────────────────────────────────────────────────────────── */
+
+const GRID_CARD_TAGS = new Set([
+  "YTD-RICH-ITEM-RENDERER", "YTD-VIDEO-RENDERER",
+  "YTD-GRID-VIDEO-RENDERER", "YTD-COMPACT-VIDEO-RENDERER",
+  "YTD-RICH-GRID-MEDIA", "YTD-REEL-ITEM-RENDERER",
+  "YTD-MOVIE-RENDERER", "YTD-PLAYLIST-VIDEO-RENDERER",
+  "YTD-CHANNEL-VIDEO-RENDERER", "YTD-PLAYLIST-PANEL-VIDEO-RENDERER",
+]);
+
+const GRID_LINK_SEL = 'a[href*="watch?v="], a[href*="/shorts/"]';
+const THUMB_IMG_SEL = 'img[src*="ytimg.com"]';
+
+// --- DOM read/write ---
 
 function cssEsc(id) {
   return typeof CSS !== "undefined" && typeof CSS.escape === "function"
@@ -332,7 +642,6 @@ function cssEsc(id) {
     : id.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
-/** Prefer updating yt-formatted-string so the host heading keeps one component child. */
 function getPinTextTarget(el) {
   if (!el) return null;
   if (el.nodeName === "YT-FORMATTED-STRING") return el;
@@ -344,7 +653,6 @@ function getPinTextTarget(el) {
 
 const PIN_TEXT_SKIP_SEL = "script, style, textarea, noscript";
 
-/** Meaningful text nodes under a root (light DOM + open shadow roots), document order. */
 function collectMeaningfulTextNodes(root, maxNodes) {
   const out = [];
   function walk(node) {
@@ -420,162 +728,7 @@ function setPinnedThumbnail(element, url) {
   }
 }
 
-/* ------------------------------------------------------------------ *
- * Reconciliation engine — the one place that pins or learns a target.
- * ------------------------------------------------------------------ */
-
-/**
- * Apply pinned values to a target, or return a learn-patch of native values.
- * @param {{ videoId:string, titleEl:Element|null, thumbEl:Element|null }} target
- * @param {{t:string|null, th:string|null}|null} record  stored pin for target.videoId
- * @param {{ expectTitle?: string|null }} [opts]  when set, only learn a title that equals it
- * @returns {{t?:string, th?:string}|null} patch to persist, or null
- */
-function reconcileTarget(target, record, opts = {}) {
-  const patch = {};
-
-  if (target.titleEl) {
-    const pinned = record && isValidTitle(record.t) ? normalizeTitle(record.t) : null;
-    if (pinned !== null) {
-      if (currentTitleText(target.titleEl) !== pinned) {
-        setPinnedTitleText(target.titleEl, pinned);
-      }
-    } else {
-      const native = currentTitleText(target.titleEl);
-      if (isValidTitle(native) && (!opts.expectTitle || native === opts.expectTitle)) {
-        patch.t = native;
-      }
-    }
-  }
-
-  if (target.thumbEl) {
-    const pinned = record && isValidThumb(record.th) ? record.th : null;
-    if (pinned !== null) {
-      if (extractThumbnailUrl(target.thumbEl) !== pinned) {
-        setPinnedThumbnail(target.thumbEl, pinned);
-      }
-    } else {
-      const native = extractThumbnailUrl(target.thumbEl);
-      if (isValidThumb(native)) patch.th = native;
-    }
-  }
-
-  return "t" in patch || "th" in patch ? patch : null;
-}
-
-/* ------------------------------------------------------------------ *
- * Watch / Shorts.
- * ------------------------------------------------------------------ */
-
-/** Prefer YouTube's navigate payload; else URL (watch ?v= or Shorts path). */
-function currentPlayerVideoId(navDetail) {
-  const fromNav = extractVideoIdFromYtNavigateDetail(navDetail);
-  if (fromNav) return fromNav;
-  if (location.pathname.startsWith("/shorts/")) {
-    const m = location.pathname.match(/\/shorts\/([a-zA-Z0-9_-]{11})/);
-    return m ? m[1] : null;
-  }
-  return extractVideoId(location.href);
-}
-
-/** The current video's title per document.title (used to confirm the watch DOM has settled). */
-function expectedTitleFromDocument() {
-  if (typeof document === "undefined" || !document.title) return "";
-  let t = document.title.replace(/^\(\d+\)\s*/, ""); // unread-count prefix
-  t = t.replace(/\s*-\s*YouTube\s*$/, ""); // trailing brand
-  return normalizeTitle(t);
-}
-
-function findWatchTitleElement(videoId) {
-  if (!videoId) return null;
-  const scope =
-    document.querySelector("#primary-inner") || document.querySelector("#primary");
-  if (!scope) return null;
-  const metas = scope.querySelectorAll(
-    `ytd-watch-metadata[video-id="${cssEsc(videoId)}"]`
-  );
-  const meta = metas.length ? metas[metas.length - 1] : null;
-  if (!meta) return null;
-  for (const sel of ["h1.ytd-watch-metadata", "#title h1", "h1"]) {
-    const el = meta.querySelector(sel);
-    if (!el) continue;
-    const t = currentTitleText(el);
-    if (t && !looksLikeTimestampOrDuration(t)) return el;
-  }
-  return null;
-}
-
-function findShortsTitleElement() {
-  const scope =
-    document.querySelector("ytd-shorts") ||
-    document.querySelector("#shorts-container") ||
-    document.body;
-  for (const sel of ["h1.ytd-watch-metadata", "h2.ytd-shorts-title", "#title h1"]) {
-    const el = scope.querySelector(sel);
-    if (!el) continue;
-    const t = currentTitleText(el);
-    if (t && !looksLikeTimestampOrDuration(t)) return el;
-  }
-  return null;
-}
-
-async function applyPlayer(navDetail) {
-  await migrationReady;
-  const myGen = ++playerApplyGen;
-
-  const videoId = currentPlayerVideoId(navDetail);
-  if (!videoId) return;
-  const onShorts = location.pathname.startsWith("/shorts/");
-
-  const pins = await getPins([videoId]);
-  if (myGen !== playerApplyGen) return;
-  const record = pins.get(videoId) || null;
-  const hasPin = record && isValidTitle(record.t);
-
-  const pickEl = () => (onShorts ? findShortsTitleElement() : findWatchTitleElement(videoId));
-
-  let cumulative = 0;
-  for (let i = 0; i < PLAYER_RETRY_MS.length; i++) {
-    const wait = PLAYER_RETRY_MS[i] - cumulative;
-    cumulative = PLAYER_RETRY_MS[i];
-    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
-
-    if (myGen !== playerApplyGen) return; // newer apply started
-    if (currentPlayerVideoId() !== videoId) return; // navigated away
-
-    const titleEl = pickEl();
-    if (!titleEl) continue;
-
-    if (hasPin) {
-      reconcileTarget({ videoId, titleEl, thumbEl: null }, record);
-      return;
-    }
-
-    // Learning: only save once the native title has settled (matches document.title),
-    // relaxing the check on the final attempt so a quirky title still gets pinned.
-    const lastTry = i === PLAYER_RETRY_MS.length - 1;
-    const expectTitle = onShorts || lastTry ? null : expectedTitleFromDocument();
-    const patch = reconcileTarget({ videoId, titleEl, thumbEl: null }, record, { expectTitle });
-    if (patch && patch.t) {
-      await commitPins(new Map([[videoId, patch]]), new Map([[videoId, record]]));
-      return;
-    }
-    // not settled yet — let the loop retry, or wait for the next page event
-  }
-}
-
-function scheduleApplyPlayer(navDetail) {
-  if (navApplyTimer) clearTimeout(navApplyTimer);
-  const d = navDetail;
-  navApplyTimer = setTimeout(() => {
-    navApplyTimer = 0;
-    void applyPlayer(d);
-  }, NAV_APPLY_DEBOUNCE_MS);
-}
-
-/* ------------------------------------------------------------------ *
- * Grid / list cards.
- * ------------------------------------------------------------------ */
+// --- DOM scan ---
 
 function closestGridCard(el) {
   let n = el;
@@ -595,336 +748,206 @@ function getGridTitleElement(card, link) {
   return link;
 }
 
-/** The video id a card currently points at (for recycling re-verification). */
-function cardVideoId(card) {
-  const a = card.querySelector(GRID_LINK_IN_CARD_SEL);
-  if (!a) return null;
-  const href = a.getAttribute("href");
-  if (!href) return null;
-  try {
-    return extractVideoId(new URL(href, location.origin).href);
-  } catch {
-    return null;
-  }
-}
-
-function anchorLooksLikeGridLink(el) {
-  if (!el || el.nodeName !== "A") return false;
-  const href = el.getAttribute("href");
-  if (!href) return false;
-  return href.includes("watch?v=") || href.includes("/shorts/");
-}
-
-function appendPrimaryInnerRoot(out) {
-  const primaryInner = document.querySelector("#primary-inner");
-  if (primaryInner && primaryInner.isConnected) {
-    out.push({ root: primaryInner, filterPrimaryInner: true });
-  }
-}
-
-/** Roots watched by MutationObservers (no #secondary). */
-function getGridObserverRoots() {
-  const out = [];
-  for (const sel of GRID_OBSERVER_ROOT_SELECTORS) {
-    document.querySelectorAll(sel).forEach((root) => {
-      if (root.isConnected) out.push({ root, filterPrimaryInner: false });
-    });
-  }
-  appendPrimaryInnerRoot(out);
-  return out;
-}
-
-/** Roots walked for anchor collection (includes #secondary). */
-function getGridScanRoots() {
-  const out = [];
-  for (const sel of GRID_SCAN_ROOT_SELECTORS) {
-    document.querySelectorAll(sel).forEach((root) => {
-      if (root.isConnected) out.push({ root, filterPrimaryInner: false });
-    });
-  }
-  appendPrimaryInnerRoot(out);
-  return out;
-}
-
-function gridLayoutRootsMatch(prev, next) {
-  if (!prev || !next || prev.length !== next.length) return false;
-  for (let i = 0; i < prev.length; i++) {
-    if (prev[i].filterPrimaryInner !== next[i].filterPrimaryInner) return false;
-    if (prev[i].root !== next[i].root) return false;
-    if (!prev[i].root.isConnected) return false;
-  }
-  return true;
-}
-
-const PLAYER_SUBTREE_SEL =
-  "ytd-player, #movie_player, video.html5-main-video, .html5-video-container";
-
-/** First GRID_SCAN_CAP watch/shorts anchors under scan roots, stopping early. */
-function collectFirstGridAnchors(maxCount) {
-  const out = [];
-  outer: for (const { root, filterPrimaryInner } of getGridScanRoots()) {
-    if (!root.isConnected) continue;
-    const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, {
-      acceptNode(node) {
-        if (!(node instanceof Element)) return NodeFilter.FILTER_SKIP;
-        if (node.matches(PLAYER_SUBTREE_SEL)) return NodeFilter.FILTER_REJECT;
-        if (filterPrimaryInner && node.matches(PRIMARY_INNER_IGNORE_SEL)) {
-          return NodeFilter.FILTER_REJECT;
-        }
-        return NodeFilter.FILTER_ACCEPT;
-      },
-    });
-    let n = walker.nextNode();
-    while (n) {
-      if (anchorLooksLikeGridLink(n)) {
-        out.push(n);
-        if (out.length >= maxCount) break outer;
-      }
-      n = walker.nextNode();
-    }
-  }
-  return out;
-}
-
-function gridMutationsTouchListUi(mutations) {
-  for (const m of mutations) {
-    let t = m.target;
-    if (t.nodeType === Node.TEXT_NODE) t = t.parentElement;
-    if (!t || typeof t.closest !== "function") continue;
-    if (t.closest(PLAYER_SUBTREE_SEL)) continue;
-    if (t.closest(PRIMARY_INNER_IGNORE_SEL)) continue;
-    return true;
-  }
-  return false;
-}
-
-function scheduleApplyGridLocks() {
-  if (gridDebounceTimer) clearTimeout(gridDebounceTimer);
-  gridDebounceTimer = setTimeout(() => {
-    gridDebounceTimer = null;
-    void applyGridLocks();
-  }, GRID_DEBOUNCE_MS);
-}
-
-/** Re-run a grid pass after TENTATIVE_SETTLE_MS so freshly recorded tentative
- *  entries are verified (or reset) before they can be committed to storage. */
-function scheduleTentativeVerification() {
-  if (tentativeVerifyTimer) return;
-  tentativeVerifyTimer = setTimeout(() => {
-    tentativeVerifyTimer = 0;
-    void applyGridLocks();
-  }, TENTATIVE_SETTLE_MS);
-}
-
-/** True when a card already matches its cached reconciled state (so it can be skipped). */
-function cardIsStable(card, id, titleEl, thumbEl) {
-  if (!gridCardCache) return false;
-  const cached = gridCardCache.get(card);
-  if (!cached || cached.id !== id) return false;
-  if (cached.t && currentTitleText(titleEl) !== cached.t) return false;
-  if (cached.th && thumbEl && extractThumbnailUrl(thumbEl) !== cached.th) return false;
-  return true;
-}
-
-async function applyGridLocks() {
+/**
+ * Apply-only DOM scan: for each visible video card, if we have a pin in
+ * the in-memory cache, write it to the DOM.  Never learns.
+ */
+async function applyDomFallback() {
   await migrationReady;
-  const myGen = ++gridApplyGen;
-  if (!document.querySelector("ytd-app")) return;
 
-  const anchors = collectFirstGridAnchors(GRID_SCAN_CAP);
+  const roots = [
+    "#contents", "ytd-miniplayer", "ytd-shorts",
+    "#secondary", "#primary-inner", "#primary",
+  ];
   const seen = new Set();
-  /** @type {{card:Element, id:string, titleEl:Element, thumbEl:Element|null}[]} */
   const targets = [];
-  for (const a of anchors) {
-    if (a.closest("ytd-watch-metadata")) continue;
-    const href = a.getAttribute("href");
-    if (!href) continue;
-    let id;
-    try {
-      id = extractVideoId(new URL(href, location.origin).href);
-    } catch {
-      continue;
-    }
-    if (!id) continue;
-    const card = closestGridCard(a);
-    if (!card || seen.has(card)) continue;
-    seen.add(card);
-    const titleEl = getGridTitleElement(card, a);
-    if (!titleEl || !getPinTextTarget(titleEl).textContent) continue;
-    const thumbEl = card.querySelector("ytd-thumbnail") || null;
-    targets.push({ card, id, titleEl, thumbEl });
-  }
-  if (targets.length === 0) return;
 
-  // Skip cards already reconciled and unchanged (no storage round-trip for them).
-  const need = targets.filter((t) => !cardIsStable(t.card, t.id, t.titleEl, t.thumbEl));
-  if (need.length === 0) return;
-
-  const ids = [...new Set(need.map((t) => t.id))];
-  const records = await getPins(ids);
-  if (myGen !== gridApplyGen) return;
-
-  const patches = new Map();
-  for (const tgt of need) {
-    // Recycling guard: the card may have been reused for another video during the await.
-    // Also clears any tentative entry left over from the previous id.
-    if (cardVideoId(tgt.card) !== tgt.id) {
-      gridTentative?.delete(tgt.card);
-      continue;
-    }
-
-    const rec = records.get(tgt.id) || null;
-    const hasPin = !!rec && (isValidTitle(rec.t) || isValidThumb(rec.th));
-
-    if (!hasPin && gridTentative) {
-      // 2-pass gate: a card with no pin must be observed twice with stable
-      // (t, th) values across TENTATIVE_SETTLE_MS before we learn them. This
-      // prevents persisting a stale value from a recycled card whose anchor
-      // href has been updated but whose title text / thumbnail image has not
-      // yet been written by YouTube.
-      const nowT = currentTitleText(tgt.titleEl);
-      const nowTh = tgt.thumbEl ? extractThumbnailUrl(tgt.thumbEl) : null;
-      const t = gridTentative.get(tgt.card);
-
-      if (!t || t.id !== tgt.id) {
-        gridTentative.set(tgt.card, {
-          id: tgt.id,
-          t: nowT,
-          th: nowTh,
-          ts: Date.now(),
-        });
-        scheduleTentativeVerification();
-        continue;
-      }
-      if (Date.now() - t.ts < TENTATIVE_SETTLE_MS) {
-        continue;
-      }
-      if (nowT !== t.t || nowTh !== t.th) {
-        gridTentative.set(tgt.card, {
-          id: tgt.id,
-          t: nowT,
-          th: nowTh,
-          ts: Date.now(),
-        });
-        scheduleTentativeVerification();
-        continue;
-      }
-      // Settled. Drop the tentative and fall through to learn + commit.
-      gridTentative.delete(tgt.card);
-    }
-
-    const patch = reconcileTarget(
-      { videoId: tgt.id, titleEl: tgt.titleEl, thumbEl: tgt.thumbEl },
-      rec
-    );
-    if (patch) {
-      const prev = patches.get(tgt.id);
-      patches.set(tgt.id, prev ? { ...prev, ...patch } : patch);
-    }
-
-    // Cache safety: only populate gridCardCache with values that already
-    // exist in storage. A freshly learned (patch.*) value may still be wrong
-    // (e.g. stale due to a later update we have not observed), and writing
-    // it to the cache would make cardIsStable return true and block any
-    // future re-reconciliation. Require both fields to be pinned so a
-    // partial pin does not hide ongoing learning of the missing field.
-    if (hasPin && gridCardCache) {
-      if (isValidTitle(rec.t) && (!tgt.thumbEl || isValidThumb(rec.th))) {
-        gridCardCache.set(tgt.card, {
-          id: tgt.id,
-          t: normalizeTitle(rec.t),
-          th: rec.th,
-        });
+  for (const sel of roots) {
+    for (const root of document.querySelectorAll(sel)) {
+      if (!root.isConnected) continue;
+      const links = root.querySelectorAll(GRID_LINK_SEL);
+      for (const a of links) {
+        if (targets.length >= DOM_SCAN_CAP) break;
+        if (a.closest("ytd-watch-metadata")) continue;
+        const href = a.getAttribute("href");
+        if (!href) continue;
+        let id;
+        try {
+          id = extractVideoId(new URL(href, location.origin).href);
+        } catch {
+          continue;
+        }
+        if (!id) continue;
+        const card = closestGridCard(a);
+        if (!card || seen.has(card)) continue;
+        seen.add(card);
+        const titleEl = getGridTitleElement(card, a);
+        if (!titleEl) continue;
+        const thumbEl = card.querySelector("ytd-thumbnail") || null;
+        targets.push({ card, id, titleEl, thumbEl });
       }
     }
   }
 
-  await commitPins(patches, records);
+  for (const t of targets) {
+    const rec = pinCache.get(t.id);
+    if (!rec) continue;
+    if (isValidTitle(rec.t) && currentTitleText(t.titleEl) !== normalizeTitle(rec.t)) {
+      setPinnedTitleText(t.titleEl, rec.t);
+    }
+    if (t.thumbEl && isValidThumb(rec.th) && extractThumbnailUrl(t.thumbEl) !== rec.th) {
+      setPinnedThumbnail(t.thumbEl, rec.th);
+    }
+  }
+}
+
+function scheduleDomFallback() {
+  if (domFallbackTimer) clearTimeout(domFallbackTimer);
+  domFallbackTimer = setTimeout(() => {
+    domFallbackTimer = null;
+    void applyDomFallback();
+  }, DOM_FALLBACK_DEBOUNCE_MS);
 }
 
 /* ------------------------------------------------------------------ *
- * Observers + bootstrap.
+ * Watch / Shorts title fallback.
+ *
+ * On a watch page the main title is normally pinned via the player
+ * response JSON (intercepted above).  This handles the rare case
+ * where the DOM is already rendered before our trap fires.
  * ------------------------------------------------------------------ */
 
-function disconnectGridSubtreeObservers() {
-  for (const o of gridSubtreeObservers) {
-    try {
-      o.disconnect();
-    } catch {
-      /* ignore */
+async function applyWatchTitle() {
+  await migrationReady;
+
+  const onShorts = location.pathname.startsWith("/shorts/");
+  let videoId;
+  if (onShorts) {
+    const m = location.pathname.match(/\/shorts\/([a-zA-Z0-9_-]{11})/);
+    videoId = m ? m[1] : null;
+  } else {
+    videoId = extractVideoId(location.href);
+  }
+  if (!videoId) return;
+
+  const rec = pinCache.get(videoId);
+  if (!rec || !isValidTitle(rec.t)) return;
+
+  const pinned = normalizeTitle(rec.t);
+
+  if (onShorts) {
+    const scope =
+      document.querySelector("ytd-shorts") ||
+      document.querySelector("#shorts-container") ||
+      document.body;
+    for (const sel of ["h1.ytd-watch-metadata", "h2.ytd-shorts-title", "#title h1"]) {
+      const el = scope.querySelector(sel);
+      if (el && currentTitleText(el) !== pinned) {
+        setPinnedTitleText(el, pinned);
+        break;
+      }
+    }
+  } else {
+    const scope =
+      document.querySelector("#primary-inner") || document.querySelector("#primary");
+    if (scope) {
+      const metas = scope.querySelectorAll(
+        `ytd-watch-metadata[video-id="${cssEsc(videoId)}"]`
+      );
+      const meta = metas.length ? metas[metas.length - 1] : null;
+      if (meta) {
+        for (const sel of ["h1.ytd-watch-metadata", "#title h1", "h1"]) {
+          const el = meta.querySelector(sel);
+          if (el && currentTitleText(el) !== pinned) {
+            setPinnedTitleText(el, pinned);
+            break;
+          }
+        }
+      }
     }
   }
-  gridSubtreeObservers = [];
 }
 
-function attachGridSubtreeObserver(root, filterPlayerSubtree) {
-  const obs = new MutationObserver((mutations) => {
-    if (filterPlayerSubtree && !gridMutationsTouchListUi(mutations)) return;
-    scheduleApplyGridLocks();
-  });
-  obs.observe(root, { childList: true, subtree: true });
-  gridSubtreeObservers.push(obs);
-}
+/* ------------------------------------------------------------------ *
+ * Bootstrap.
+ * ------------------------------------------------------------------ */
 
-function scheduleResyncGridObservers() {
-  if (gridResyncTimer) clearTimeout(gridResyncTimer);
-  gridResyncTimer = setTimeout(() => {
-    gridResyncTimer = null;
-    syncGridObservers();
-  }, GRID_RESYNC_DEBOUNCE_MS);
-}
-
-function syncGridObservers() {
-  const app = document.querySelector("ytd-app");
-  if (!app) return;
-
-  const layoutRoots = getGridObserverRoots();
-  if (gridLayoutRootsMatch(lastGridLayoutRoots, layoutRoots)) {
-    if (!gridAppStructureObserver) {
-      gridAppStructureObserver = new MutationObserver(() => scheduleResyncGridObservers());
-      gridAppStructureObserver.observe(app, { childList: true, subtree: false });
-    }
-    return;
-  }
-
-  lastGridLayoutRoots = layoutRoots;
-  disconnectGridSubtreeObservers();
-  for (const { root, filterPrimaryInner } of layoutRoots) {
-    attachGridSubtreeObserver(root, filterPrimaryInner);
-  }
-  if (!gridAppStructureObserver) {
-    gridAppStructureObserver = new MutationObserver(() => scheduleResyncGridObservers());
-    gridAppStructureObserver.observe(app, { childList: true, subtree: false });
-  }
-}
-
-function onPageEvent(navDetail) {
-  scheduleApplyPlayer(navDetail);
-  scheduleApplyGridLocks();
-  syncGridObservers();
-}
-
-// Only wire up live behaviour inside the extension (guarded so the file can be unit-tested).
 if (typeof document !== "undefined" && typeof browser !== "undefined") {
-  migrationReady = migrateLegacyIfNeeded();
-
-  browser.runtime.onMessage.addListener((msg) => {
-    if (msg && msg.type === "ytTitleLockHistoryState") onPageEvent(null);
+  // Migration runs first (it may produce legacy records for the cache).
+  migrationReady = migrateLegacyIfNeeded().then(async () => {
+    await loadPinCache();
+    cacheLoaded = true;
+    pinCacheResolve();
   });
 
-  // yt-page-data-updated is YouTube's "page data settled" signal; yt-navigate-finish fires
-  // on SPA navigation. Both are events (not continuous observers on the title).
-  for (const evt of ["yt-navigate-finish", "yt-page-data-updated"]) {
-    document.addEventListener(evt, (ev) => onPageEvent(ev.detail), true);
+  // 1. Install initial-data traps before YouTube's JS boots.
+  installInitialDataTraps();
+
+  // 2. Monkey-patch network layer.
+  patchFetch();
+  patchXHR();
+
+  // 3. Keep the cache in sync if another tab writes new pins.
+  if (browser.storage?.onChanged) {
+    browser.storage.onChanged.addListener((changes, area) => {
+      if (area !== "local") return;
+      for (const k of Object.keys(changes)) {
+        if (!k.startsWith(PIN_PREFIX)) continue;
+        const id = k.slice(PIN_PREFIX.length);
+        const { newValue } = changes[k];
+        if (newValue && typeof newValue === "object" && (newValue.t || newValue.th)) {
+          pinCache.set(id, newValue);
+        } else {
+          pinCache.delete(id);
+        }
+      }
+    });
   }
 
-  window.addEventListener("popstate", () => onPageEvent(null));
+  // 4. React to YouTube's own navigation events (complementary).
+  browser.runtime.onMessage.addListener((msg) => {
+    if (msg && msg.type === "ytTitleLockHistoryState") {
+      scheduleDomFallback();
+    }
+  });
 
-  syncGridObservers();
-  requestAnimationFrame(() => requestAnimationFrame(() => onPageEvent(null)));
+  for (const evt of ["yt-navigate-finish", "yt-page-data-updated"]) {
+    document.addEventListener(
+      evt,
+      () => {
+        scheduleDomFallback();
+        applyWatchTitle();
+      },
+      true
+    );
+  }
+
+  window.addEventListener("popstate", () => {
+    scheduleDomFallback();
+  });
+
+  // 5. First paint — handle the case where ytInitialData was already set
+  //    before our trap fired (e.g. Firefox script execution ordering).
+  requestAnimationFrame(() => {
+    requestAnimationFrame(async () => {
+      await migrationReady;
+      if (window.ytInitialData) {
+        const entries = collectVideoEntries(window.ytInitialData, 4000);
+        processEntries(entries);
+      }
+      if (window.ytInitialPlayerResponse) {
+        const entries = collectVideoEntries(window.ytInitialPlayerResponse, 4000);
+        processEntries(entries);
+      }
+      scheduleDomFallback();
+      applyWatchTitle();
+    });
+  });
 }
 
-// Export pure helpers for unit tests (no-op in the browser).
+/* ------------------------------------------------------------------ *
+ * Unit-test exports.
+ * ------------------------------------------------------------------ */
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     normalizeTitle,
@@ -935,7 +958,6 @@ if (typeof module !== "undefined" && module.exports) {
     extractVideoIdFromYtNavigateDetail,
     mergeRecord,
     selectKeysToEvict,
-    expectedTitleFromDocument,
     PIN_PREFIX,
     PIN_MAX,
     TENTATIVE_SETTLE_MS,
