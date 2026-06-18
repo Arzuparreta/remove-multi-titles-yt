@@ -12,7 +12,13 @@ const root = path.join(__dirname, "..");
 const out = path.join(root, "dist", "chrome-unpacked");
 const libOut = path.join(out, "lib");
 
-const rootFiles = ["background.js", "content.js"];
+const rootFiles = [
+  "background.js",
+  "content.js",
+  "popup.html",
+  "popup.css",
+  "popup.js",
+];
 
 fs.mkdirSync(libOut, { recursive: true });
 

@@ -24,6 +24,7 @@
  * ------------------------------------------------------------------ */
 
 const PIN_PREFIX = "ytPin:";
+const ENABLED_KEY = "ytPinEnabled";
 const SCHEMA_KEY = "ytPinSchema";
 const SCHEMA_VERSION = 2;
 const LEGACY_TITLE_PREFIX = "ytTitleLock:";
@@ -65,6 +66,9 @@ let learnedSincePruneCheck = 0;
 
 let domFallbackTimer = null;
 let migrationReady = Promise.resolve();
+
+/** Master on/off switch, controlled from the toolbar popup. Default on. */
+let enabled = true;
 
 /* ------------------------------------------------------------------ *
  * Pure helpers (no DOM / no storage).
@@ -188,6 +192,7 @@ function extractVideoIdFromYtNavigateDetail(detail) {
 async function loadPinCache() {
   try {
     const all = await browser.storage.local.get(null);
+    enabled = all[ENABLED_KEY] !== false; // absent / true = enabled
     for (const k of Object.keys(all)) {
       if (!k.startsWith(PIN_PREFIX)) continue;
       const rec = all[k];
@@ -438,6 +443,8 @@ function collectVideoEntries(root, maxEntries) {
  * Returns true if any pin was applied (meaning the JSON was modified).
  */
 function processEntries(entries) {
+  if (!enabled) return false;
+
   let modified = false;
   const newlySeen = [];
 
@@ -754,6 +761,7 @@ function getGridTitleElement(card, link) {
  */
 async function applyDomFallback() {
   await migrationReady;
+  if (!enabled) return;
 
   const roots = [
     "#contents", "ytd-miniplayer", "ytd-shorts",
@@ -819,6 +827,7 @@ function scheduleDomFallback() {
 
 async function applyWatchTitle() {
   await migrationReady;
+  if (!enabled) return;
 
   const onShorts = location.pathname.startsWith("/shorts/");
   let videoId;
@@ -891,6 +900,16 @@ if (typeof document !== "undefined" && typeof browser !== "undefined") {
   if (browser.storage?.onChanged) {
     browser.storage.onChanged.addListener((changes, area) => {
       if (area !== "local") return;
+      if (Object.prototype.hasOwnProperty.call(changes, ENABLED_KEY)) {
+        enabled = changes[ENABLED_KEY].newValue !== false;
+        // Re-pin the current page immediately when switched back on.
+        // (Switching off stops future pinning; already-shown values
+        //  revert on the next navigation / reload.)
+        if (enabled) {
+          scheduleDomFallback();
+          applyWatchTitle();
+        }
+      }
       for (const k of Object.keys(changes)) {
         if (!k.startsWith(PIN_PREFIX)) continue;
         const id = k.slice(PIN_PREFIX.length);
