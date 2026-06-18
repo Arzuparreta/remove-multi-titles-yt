@@ -3,7 +3,7 @@
   "name": "Remove Multi Titles (YouTube)",
   "version": "2.3.0",
   "author": "Arzuparreta",
-  "homepage_url": "https://github.com/Arzuparreta/Arzuparreta/tree/main/projects/repos/remove-multi-titles-yt",
+  "homepage_url": "https://github.com/Arzuparreta/remove-multi-titles-yt",
   "description": "Pins the first-seen title and thumbnail per video on YouTube (watch, Shorts, and lists) to reduce A/B title and thumbnail flicker.",
   "icons": {
     "16": "icons/icon16.png",

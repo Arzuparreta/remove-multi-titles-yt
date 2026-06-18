@@ -4,8 +4,7 @@ const api = globalThis.browser ?? chrome;
 
 /** Storage flag shared with content.js. Absent / true = enabled. */
 const ENABLED_KEY = "ytPinEnabled";
-const GITHUB_URL =
-  "https://github.com/Arzuparreta/Arzuparreta/tree/main/projects/repos/remove-multi-titles-yt";
+const GITHUB_URL = "https://github.com/Arzuparreta/remove-multi-titles-yt";
 
 const toggle = document.getElementById("toggle");
 const stateText = document.getElementById("stateText");
