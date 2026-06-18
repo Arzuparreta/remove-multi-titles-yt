@@ -27,7 +27,7 @@ Checklist:
 Both stores ask for a link to your privacy policy.
 
 1. Host [PRIVACY.md](PRIVACY.md) at a **public URL**, for example:
-   - Raw GitHub: `https://raw.githubusercontent.com/Arzuparreta/Arzuparreta/main/projects/repos/remove-multi-titles-yt/PRIVACY.md`, or  
+   - Raw GitHub: `https://raw.githubusercontent.com/Arzuparreta/remove-multi-titles-yt/main/PRIVACY.md`, or  
    - [GitHub Pages](https://pages.github.com/) serving the same text as HTML, or  
    - Any page on a domain you control.
 
@@ -70,5 +70,5 @@ This package includes **minified** third-party code: `lib/browser-polyfill.min.j
 
 ## Project links
 
-- Repository: https://github.com/Arzuparreta/Arzuparreta/tree/main/projects/repos/remove-multi-titles-yt  
+- Repository: https://github.com/Arzuparreta/remove-multi-titles-yt  
 - Update `homepage_url` in `manifest.json` if the canonical URL changes.
