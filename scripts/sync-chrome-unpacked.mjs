@@ -14,6 +14,7 @@ const libOut = path.join(out, "lib");
 
 const rootFiles = [
   "background.js",
+  "content-main.js",
   "content.js",
   "popup.html",
   "popup.css",
