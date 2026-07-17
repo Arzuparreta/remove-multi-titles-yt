@@ -2,18 +2,19 @@
  * Pins the first-seen title and thumbnail per YouTube video to prevent
  * A/B-test flicker.
  *
- * Strategy: `content-main.js` runs in YouTube's MAIN world and intercepts
- * InnerTube responses / initial page data before YouTube renders them.
- * This isolated script owns extension storage, decides which values are
- * pinned, learns first-seen tuples, and applies a small DOM fallback only
- * where response-body replacement is not possible.
+ * Two content scripts cooperate:
+ *  - `content-main.js` runs in YouTube's MAIN world and rewrites InnerTube
+ *    responses (`fetch` / XHR / `ytInitialData`) before they render. That is the
+ *    anti-flicker path.
+ *  - This script (ISOLATED world) owns `browser.storage.local`. It is the single
+ *    authority for the pin cache: it mirrors the cache into the MAIN world
+ *    (SET_CACHE / PATCH_CACHE), absorbs newly learned values from MAIN (LEARN),
+ *    and runs a hardened DOM reconciler as a safety net for surfaces the
+ *    interception missed (Chrome document_start races, XHR getter-override
+ *    failures, already-rendered DOM).
  *
- * `content-main.js` cannot access browser.storage from the MAIN world, so it
- * sends stripped video entries here through window.postMessage and receives
- * only the patches needed for the current response.
- *
- * Storage: one record per video, `ytPin:<id> = { t, th, ts }`.
- * LRU-pruned to PIN_MAX.
+ * Storage: one record per video, `ytPin:<id> = { t, th, ts }`. LRU-pruned to
+ * PIN_MAX.
  */
 
 /* ------------------------------------------------------------------ *
@@ -31,34 +32,37 @@ const PIN_MAX = 5000;
 const PRUNE_CHECK_EVERY = 200;
 
 const YT_ID_RE = /[a-zA-Z0-9_-]{11}/;
-const PAGE_BRIDGE_SOURCE = "yt-pin-main";
-const CONTENT_BRIDGE_SOURCE = "yt-pin-content";
+const YT_ID_STRICT_RE = /^[a-zA-Z0-9_-]{11}$/;
+const PAGE_BRIDGE_SOURCE = "yt-pin-main"; // messages FROM the MAIN world
+const CONTENT_BRIDGE_SOURCE = "yt-pin-content"; // messages WE send
 
-/** DOM fallback debounce (apply-only, no learning). */
-const DOM_FALLBACK_DEBOUNCE_MS = 450;
+/** DOM reconciler debounce (apply-only safety net, never learns). */
+const RECONCILE_DEBOUNCE_MS = 300;
+/** Delay before re-attaching observers after a layout swap. */
+const RESYNC_DEBOUNCE_MS = 800;
 /** Minimum ms between storage commits after learning new entries. */
 const COMMIT_DEBOUNCE_MS = 500;
-/** Max entries to scan per DOM pass. */
-const DOM_SCAN_CAP = 180;
+/** Max cards to reconcile per DOM pass. */
+const DOM_SCAN_CAP = 200;
+/** Max anchors to examine per DOM pass (comment timestamp links inflate this). */
+const DOM_LINK_CAP = 1500;
 
 /** Legacy constant — kept for unit-test compatibility with the old 2-pass gate. */
 const TENTATIVE_SETTLE_MS = 750;
 
 // --- state ---
 
-/**
- * In-memory pin cache: Map<videoId, {t, th, ts}>.
- * Loaded from storage on startup, kept in sync via storage.onChanged.
- * This lets us apply pins SYNCHRONOUSLY inside fetch/initial-data traps.
- */
+/** In-memory pin cache: Map<videoId, {t, th, ts}>. Authoritative in this world. */
 const pinCache = new Map();
-/** Entries learned this session that haven't been flushed to storage yet. */
+/** Full records queued for the next debounced storage write. */
 const pendingWrites = new Map();
 let commitTimer = null;
 let learnedSincePruneCheck = 0;
 
-let domFallbackTimer = null;
+let reconcileTimer = null;
+let resyncTimer = null;
 let migrationReady = Promise.resolve();
+let cacheReady = false;
 
 /** Master on/off switch, controlled from the toolbar popup. Default on. */
 let enabled = true;
@@ -90,13 +94,18 @@ function isValidTitle(s) {
 }
 
 function isValidThumb(s) {
-  return typeof s === "string" && s.includes("ytimg.com");
+  return typeof s === "string" && s.includes("ytimg.com") && /\/vi(_webp)?\//.test(s);
+}
+
+function isValidId(s) {
+  return typeof s === "string" && YT_ID_STRICT_RE.test(s);
 }
 
 function pinKey(id) {
   return `${PIN_PREFIX}${id}`;
 }
 
+/** Permissive merge used by migration / cache folds (keeps untouched fields). */
 function mergeRecord(prev, patch) {
   const next = {
     t: prev && typeof prev.t === "string" ? prev.t : null,
@@ -105,6 +114,55 @@ function mergeRecord(prev, patch) {
   };
   if (patch && typeof patch.t === "string" && patch.t) next.t = patch.t;
   if (patch && typeof patch.th === "string" && patch.th) next.th = patch.th;
+  return next;
+}
+
+/**
+ * Split a ytimg URL into stable parts. Mirror of content-main.js parseThumb.
+ * The A/B variance lives in the `_custom_N` suffix; resolution and volatile
+ * `sqp`/`rs` params are orthogonal.
+ */
+function parseThumb(url) {
+  if (typeof url !== "string") return null;
+  const m = url.match(
+    /\/vi(_webp)?\/([a-zA-Z0-9_-]{11})\/([a-z0-9]+?)(?:_custom_(\d+))?\.(jpg|webp|png)/i
+  );
+  if (!m) return null;
+  return {
+    webp: !!m[1],
+    id: m[2],
+    res: m[3],
+    variant: m[4] ? `_custom_${m[4]}` : "",
+    ext: m[5],
+  };
+}
+
+/** Clean, param-less base thumbnail URL — never expires. */
+function buildBaseThumb(id, res, webp) {
+  return `https://i.ytimg.com/${webp ? "vi_webp" : "vi"}/${id}/${res}.${webp ? "webp" : "jpg"}`;
+}
+
+/**
+ * Conservative learn merge: fill missing fields only, and refresh a thumbnail's
+ * volatile params only when it is the *same* A/B variant. Never clobbers an
+ * existing title or a different thumbnail variant (that would be a leak).
+ */
+function learnMerge(prev, patch) {
+  const next = {
+    t: prev && typeof prev.t === "string" ? prev.t : null,
+    th: prev && typeof prev.th === "string" ? prev.th : null,
+    ts: Date.now(),
+  };
+  if (!next.t && isValidTitle(patch.t)) next.t = normalizeTitle(patch.t);
+  if (isValidThumb(patch.th)) {
+    if (!next.th) {
+      next.th = patch.th;
+    } else if (next.th !== patch.th) {
+      const pv = parseThumb(next.th);
+      const pe = parseThumb(patch.th);
+      if (pv && pe && pv.variant && pv.variant === pe.variant) next.th = patch.th;
+    }
+  }
   return next;
 }
 
@@ -178,10 +236,9 @@ function extractVideoIdFromYtNavigateDetail(detail) {
 }
 
 /* ------------------------------------------------------------------ *
- * Pin cache — in-memory, kept in sync with storage.
+ * Storage layer.
  * ------------------------------------------------------------------ */
 
-/** Load the full cache from storage (called once on startup). */
 async function loadPinCache() {
   try {
     const all = await browser.storage.local.get(null);
@@ -198,7 +255,6 @@ async function loadPinCache() {
   }
 }
 
-/** Persist pending writes to storage, debounced. */
 function scheduleCommit() {
   if (commitTimer) return;
   commitTimer = setTimeout(() => {
@@ -208,14 +264,10 @@ function scheduleCommit() {
 }
 
 async function flushCommit() {
+  if (pendingWrites.size === 0) return;
   const writes = {};
-  for (const [id, patch] of pendingWrites) {
-    const existing = pinCache.get(id);
-    writes[pinKey(id)] = mergeRecord(existing || null, patch);
-  }
+  for (const [id, rec] of pendingWrites) writes[pinKey(id)] = rec;
   pendingWrites.clear();
-
-  if (Object.keys(writes).length === 0) return;
 
   try {
     await browser.storage.local.set(writes);
@@ -280,101 +332,68 @@ async function migrateLegacyIfNeeded() {
 }
 
 /* ------------------------------------------------------------------ *
- * MAIN-world bridge.
+ * MAIN-world bridge (this world is the cache authority).
  * ------------------------------------------------------------------ */
 
-function postBridgeMessage(type, payload, requestId) {
-  window.postMessage(
-    { source: CONTENT_BRIDGE_SOURCE, type, requestId, payload },
-    "*"
-  );
+function sendToMain(type, payload) {
+  window.postMessage({ source: CONTENT_BRIDGE_SOURCE, type, payload }, "*");
 }
 
-function sendBridgeReady() {
-  postBridgeMessage("READY", { enabled });
-}
-
-function processBridgeEntries(entries, canModify) {
-  if (!enabled) return { enabled: false, patches: [] };
-
-  const patches = [];
-  const newlySeen = [];
-  let needsDomApply = false;
-
-  for (const e of entries) {
-    if (!e || !e.videoId) continue;
-    const rec = pinCache.get(e.videoId);
-
-    if (rec) {
-      const patch = { i: e.i };
-      if (isValidTitle(rec.t)) patch.t = normalizeTitle(rec.t);
-      if (isValidThumb(rec.th)) patch.th = rec.th;
-      if (patch.t || patch.th) {
-        patches.push(patch);
-        if (!canModify) needsDomApply = true;
-      }
-
-      const missing = {};
-      if (!isValidTitle(rec.t) && isValidTitle(e.title)) {
-        missing.t = normalizeTitle(e.title);
-      }
-      if (!isValidThumb(rec.th) && isValidThumb(e.thumbUrl)) {
-        missing.th = e.thumbUrl;
-      }
-      if (missing.t || missing.th) newlySeen.push({ id: e.videoId, patch: missing });
-      continue;
-    }
-
-    const firstSeen = {};
-    if (isValidTitle(e.title)) firstSeen.t = normalizeTitle(e.title);
-    if (isValidThumb(e.thumbUrl)) firstSeen.th = e.thumbUrl;
-    if (firstSeen.t || firstSeen.th) newlySeen.push({ id: e.videoId, patch: firstSeen });
+function sendFullCache() {
+  const entries = [];
+  for (const [id, rec] of pinCache) {
+    if (rec && (rec.t || rec.th)) entries.push([id, { t: rec.t || null, th: rec.th || null }]);
   }
-
-  for (const { id, patch } of newlySeen) {
-    const existing = pinCache.get(id);
-    pinCache.set(id, mergeRecord(existing || null, patch));
-    const prev = pendingWrites.get(id);
-    pendingWrites.set(id, prev ? { ...prev, ...patch } : patch);
-  }
-
-  if (newlySeen.length > 0) scheduleCommit();
-  if (needsDomApply) scheduleDomFallback();
-
-  return { enabled: true, patches };
+  sendToMain("SET_CACHE", { enabled, entries });
 }
 
-async function handleBridgeRequest(type, payload) {
-  await migrationReady;
-  if (type !== "PROCESS_ENTRIES") return { enabled, patches: [] };
+function sendPatch(records, enabledChanged) {
+  const payload = { records };
+  if (enabledChanged) payload.enabled = enabled;
+  sendToMain("PATCH_CACHE", payload);
+}
+
+/** Absorb first-seen values discovered by the MAIN-world interception. */
+function handleLearn(payload) {
+  if (!enabled) return;
   const entries = Array.isArray(payload?.entries) ? payload.entries : [];
-  return processBridgeEntries(entries, payload?.canModify !== false);
+  let changed = false;
+  for (const e of entries) {
+    if (!e || !isValidId(e.id)) continue;
+    if (!isValidTitle(e.t) && !isValidThumb(e.th)) continue;
+    const prev = pinCache.get(e.id) || null;
+    const merged = learnMerge(prev, { t: e.t, th: e.th });
+    if (!prev || prev.t !== merged.t || prev.th !== merged.th) {
+      pinCache.set(e.id, merged);
+      pendingWrites.set(e.id, merged);
+      changed = true;
+    }
+  }
+  // MAIN already updated its mirror optimistically; the debounced commit's
+  // storage.onChanged will push the canonical record back to MAIN.
+  if (changed) scheduleCommit();
 }
 
-function installPageBridge() {
+function installMainBridge() {
   window.addEventListener("message", (event) => {
     if (event.source !== window) return;
     const msg = event.data;
     if (!msg || msg.source !== PAGE_BRIDGE_SOURCE) return;
 
-    if (msg.type === "READY") {
-      void migrationReady.then(sendBridgeReady);
+    if (msg.type === "HELLO") {
+      if (cacheReady) sendFullCache();
       return;
     }
-
-    if (msg.type !== "PROCESS_ENTRIES") return;
-    void handleBridgeRequest(msg.type, msg.payload).then((payload) => {
-      postBridgeMessage("RESPONSE", payload, msg.requestId);
-    });
+    if (msg.type === "LEARN") {
+      void migrationReady.then(() => handleLearn(msg.payload));
+      return;
+    }
   });
 }
 
 /* ------------------------------------------------------------------ *
- * DOM fallback (apply-only, never learns).
- *
- * Handles the rare case where XHR responses were not modified and
- * YouTube's DOM still shows the native title/thumbnail.
- * ─────────────────────────────────────────────────────────────────── */
+ * DOM read/write primitives (Trusted-Types-safe: text nodes / img.src only).
+ * ------------------------------------------------------------------ */
 
 const GRID_CARD_TAGS = new Set([
   "YTD-RICH-ITEM-RENDERER", "YTD-VIDEO-RENDERER",
@@ -386,8 +405,6 @@ const GRID_CARD_TAGS = new Set([
 
 const GRID_LINK_SEL = 'a[href*="watch?v="], a[href*="/shorts/"]';
 const THUMB_IMG_SEL = 'img[src*="ytimg.com"]';
-
-// --- DOM read/write ---
 
 function cssEsc(id) {
   return typeof CSS !== "undefined" && typeof CSS.escape === "function"
@@ -457,31 +474,55 @@ function setPinnedTitleText(host, pin) {
   target.textContent = lock;
 }
 
-function extractThumbnailUrl(element) {
-  if (!element) return null;
-  const img = element.querySelector(THUMB_IMG_SEL);
-  if (img) return img.src;
-  const style = element.style?.backgroundImage;
-  if (style && style.includes("ytimg.com")) {
-    const m = style.match(/url\(["']?([^"')]+)["']?\)/);
-    return m ? m[1] : null;
-  }
-  return null;
+/**
+ * Compute the URL to write into a thumbnail <img> so it shows the pinned A/B
+ * variant while keeping the slot's own resolution. Returns null if no change.
+ */
+function thumbUrlToApply(currentUrl, pinnedTh) {
+  const pv = parseThumb(pinnedTh);
+  if (!pv) return null;
+  const pe = parseThumb(currentUrl);
+  if (!pe) return pinnedTh;
+  if (pe.variant === pv.variant) return null; // already the pinned variant
+  return pv.variant === "" ? buildBaseThumb(pe.id, pe.res, pe.webp) : pinnedTh;
 }
 
-function setPinnedThumbnail(element, url) {
-  if (!element || !url) return;
-  const img = element.querySelector(THUMB_IMG_SEL) || element.querySelector("img");
-  if (img) {
-    if (img.src !== url) img.src = url;
-    return;
-  }
-  if (element.style?.backgroundImage) {
-    element.style.backgroundImage = `url('${url}')`;
-  }
+const thumbFallbackBound = new WeakSet();
+
+/** If a pinned (possibly expired custom) thumbnail fails, revert to native. */
+function bindThumbFallback(img) {
+  if (thumbFallbackBound.has(img)) return;
+  thumbFallbackBound.add(img);
+  img.addEventListener("error", function onErr() {
+    const native = img.getAttribute("data-ytpin-native");
+    if (!native || img.getAttribute("data-ytpin-reverted")) return;
+    img.setAttribute("data-ytpin-reverted", "1");
+    if (img.src !== native) img.src = native;
+  });
 }
 
-// --- DOM scan ---
+function setPinnedThumbnail(container, pinnedTh) {
+  if (!container || !isValidThumb(pinnedTh)) return;
+  // Only ever touch a real ytimg <img>; never stamp onto avatars/placeholders.
+  const img = container.querySelector(THUMB_IMG_SEL);
+  if (!img) return;
+  const cur = img.getAttribute("src") || img.src || "";
+  const next = thumbUrlToApply(cur, pinnedTh);
+  if (!next || img.src === next) return;
+  // We only reach here when `cur` is a non-pinned (native/other) URL, so it is
+  // exactly the value to fall back to. Refresh it every time so a recycled <img>
+  // never reverts to a previous video's thumbnail.
+  if (cur) {
+    img.setAttribute("data-ytpin-native", cur);
+    img.removeAttribute("data-ytpin-reverted");
+    bindThumbFallback(img);
+  }
+  img.src = next;
+}
+
+/* ------------------------------------------------------------------ *
+ * DOM reconciler (apply-only safety net; never learns).
+ * ------------------------------------------------------------------ */
 
 function closestGridCard(el) {
   let n = el;
@@ -501,11 +542,38 @@ function getGridTitleElement(card, link) {
   return link;
 }
 
-/**
- * Apply-only DOM scan: for each visible video card, if we have a pin in
- * the in-memory cache, write it to the DOM.  Never learns.
- */
-async function applyDomFallback() {
+/** The video id a card currently resolves to (used as a recycling guard). */
+function cardVideoId(card) {
+  const a = card.querySelector(GRID_LINK_SEL);
+  const href = a?.getAttribute("href");
+  if (!href) return null;
+  try {
+    return extractVideoId(new URL(href, location.origin).href);
+  } catch {
+    return null;
+  }
+}
+
+function applyToCard(card, link, id, rec) {
+  const href = link.getAttribute("href") || "";
+  const isShort =
+    href.startsWith("/shorts/") ||
+    card.nodeName === "YTD-REEL-ITEM-RENDERER" ||
+    !!card.closest("ytd-shorts");
+
+  if (isValidTitle(rec.t)) {
+    const titleEl = getGridTitleElement(card, link);
+    if (titleEl && currentTitleText(titleEl) !== normalizeTitle(rec.t)) {
+      setPinnedTitleText(titleEl, rec.t);
+    }
+  }
+  // Never cross-apply a (horizontal) video thumbnail onto a Shorts slot.
+  if (!isShort && isValidThumb(rec.th)) {
+    setPinnedThumbnail(card.querySelector("ytd-thumbnail") || card, rec.th);
+  }
+}
+
+async function reconcileDom() {
   await migrationReady;
   if (!enabled) return;
 
@@ -514,14 +582,15 @@ async function applyDomFallback() {
     "#secondary", "#primary-inner", "#primary",
   ];
   const seen = new Set();
-  const targets = [];
+  let applied = 0;
+  let examined = 0;
 
   for (const sel of roots) {
     for (const root of document.querySelectorAll(sel)) {
       if (!root.isConnected) continue;
-      const links = root.querySelectorAll(GRID_LINK_SEL);
-      for (const a of links) {
-        if (targets.length >= DOM_SCAN_CAP) break;
+      for (const a of root.querySelectorAll(GRID_LINK_SEL)) {
+        if (applied >= DOM_SCAN_CAP || examined >= DOM_LINK_CAP) return;
+        examined++;
         if (a.closest("ytd-watch-metadata")) continue;
         const href = a.getAttribute("href");
         if (!href) continue;
@@ -535,40 +604,32 @@ async function applyDomFallback() {
         const card = closestGridCard(a);
         if (!card || seen.has(card)) continue;
         seen.add(card);
-        const titleEl = getGridTitleElement(card, a);
-        if (!titleEl) continue;
-        const thumbEl = card.querySelector("ytd-thumbnail") || null;
-        targets.push({ card, id, titleEl, thumbEl });
+        const rec = pinCache.get(id);
+        if (!rec) continue;
+        // Recycling guard: the card must still resolve to this id.
+        if (cardVideoId(card) !== id) continue;
+        applyToCard(card, a, id, rec);
+        applied++;
       }
     }
   }
-
-  for (const t of targets) {
-    const rec = pinCache.get(t.id);
-    if (!rec) continue;
-    if (isValidTitle(rec.t) && currentTitleText(t.titleEl) !== normalizeTitle(rec.t)) {
-      setPinnedTitleText(t.titleEl, rec.t);
-    }
-    if (t.thumbEl && isValidThumb(rec.th) && extractThumbnailUrl(t.thumbEl) !== rec.th) {
-      setPinnedThumbnail(t.thumbEl, rec.th);
-    }
-  }
 }
 
-function scheduleDomFallback() {
-  if (domFallbackTimer) clearTimeout(domFallbackTimer);
-  domFallbackTimer = setTimeout(() => {
-    domFallbackTimer = null;
-    void applyDomFallback();
-  }, DOM_FALLBACK_DEBOUNCE_MS);
+/**
+ * Trailing-edge throttle (not a resetting debounce): once a pass is pending it
+ * is not pushed back by further mutations, so continuous churn (comments, live
+ * chat) can never starve the reconciler.
+ */
+function scheduleReconcile() {
+  if (reconcileTimer) return;
+  reconcileTimer = setTimeout(() => {
+    reconcileTimer = null;
+    void reconcileDom();
+  }, RECONCILE_DEBOUNCE_MS);
 }
 
 /* ------------------------------------------------------------------ *
- * Watch / Shorts title fallback.
- *
- * On a watch page the main title is normally pinned via the player
- * response JSON (intercepted above).  This handles the rare case
- * where the DOM is already rendered before our trap fires.
+ * Watch / Shorts title reconciler.
  * ------------------------------------------------------------------ */
 
 async function applyWatchTitle() {
@@ -610,17 +671,56 @@ async function applyWatchTitle() {
         `ytd-watch-metadata[video-id="${cssEsc(videoId)}"]`
       );
       const meta = metas.length ? metas[metas.length - 1] : null;
-      if (meta) {
-        for (const sel of ["h1.ytd-watch-metadata", "#title h1", "h1"]) {
-          const el = meta.querySelector(sel);
-          if (el && currentTitleText(el) !== pinned) {
-            setPinnedTitleText(el, pinned);
-            break;
-          }
+      const host = meta || scope;
+      for (const sel of ["h1.ytd-watch-metadata", "#title h1", "h1"]) {
+        const el = host.querySelector(sel);
+        if (el && currentTitleText(el) !== pinned) {
+          setPinnedTitleText(el, pinned);
+          break;
         }
       }
     }
   }
+}
+
+function applyAll() {
+  scheduleReconcile();
+  void applyWatchTitle();
+}
+
+/* ------------------------------------------------------------------ *
+ * Scoped, debounced subtree observers (safety net for scroll/lazy surfaces).
+ * `#secondary` is intentionally excluded (it mutates constantly); it is still
+ * scanned on nav/data triggers via reconcileDom's root list.
+ * ------------------------------------------------------------------ */
+
+let subtreeObserver = null;
+
+function attachObservers() {
+  if (typeof MutationObserver === "undefined") return;
+  if (!subtreeObserver) {
+    subtreeObserver = new MutationObserver(() => scheduleReconcile());
+  } else {
+    subtreeObserver.disconnect();
+  }
+  // Observe only the infinite-scroll grid feeds. Comments / live chat / player
+  // (under #primary-inner) churn constantly and are covered by the interception
+  // layer and event-driven reconciles instead.
+  for (const sel of ["#contents", "ytd-shorts"]) {
+    for (const el of document.querySelectorAll(sel)) {
+      if (el.isConnected) {
+        subtreeObserver.observe(el, { childList: true, subtree: true });
+      }
+    }
+  }
+}
+
+function scheduleResync() {
+  if (resyncTimer) clearTimeout(resyncTimer);
+  resyncTimer = setTimeout(() => {
+    resyncTimer = null;
+    attachObservers();
+  }, RESYNC_DEBOUNCE_MS);
 }
 
 /* ------------------------------------------------------------------ *
@@ -628,46 +728,48 @@ async function applyWatchTitle() {
  * ------------------------------------------------------------------ */
 
 if (typeof document !== "undefined" && typeof browser !== "undefined") {
-  installPageBridge();
+  installMainBridge();
 
-  // Migration runs first (it may produce legacy records for the cache).
   migrationReady = migrateLegacyIfNeeded().then(async () => {
     await loadPinCache();
-    sendBridgeReady();
+    cacheReady = true;
+    sendFullCache(); // push snapshot to MAIN (covers a HELLO we already got)
+    attachObservers();
+    applyAll();
   });
 
-  // Keep the cache in sync if another tab writes new pins.
+  // Cross-tab / own-commit sync: update the cache and mirror deltas to MAIN.
   if (browser.storage?.onChanged) {
     browser.storage.onChanged.addListener((changes, area) => {
       if (area !== "local") return;
+      let enabledChanged = false;
       if (Object.prototype.hasOwnProperty.call(changes, ENABLED_KEY)) {
         enabled = changes[ENABLED_KEY].newValue !== false;
-        sendBridgeReady();
-        // Re-pin the current page immediately when switched back on.
-        // (Switching off stops future pinning; already-shown values
-        //  revert on the next navigation / reload.)
-        if (enabled) {
-          scheduleDomFallback();
-          applyWatchTitle();
-        }
+        enabledChanged = true;
       }
+      const records = [];
       for (const k of Object.keys(changes)) {
         if (!k.startsWith(PIN_PREFIX)) continue;
         const id = k.slice(PIN_PREFIX.length);
-        const { newValue } = changes[k];
-        if (newValue && typeof newValue === "object" && (newValue.t || newValue.th)) {
-          pinCache.set(id, newValue);
+        const nv = changes[k].newValue;
+        if (nv && typeof nv === "object" && (nv.t || nv.th)) {
+          pinCache.set(id, nv);
+          records.push([id, { t: nv.t || null, th: nv.th || null }]);
         } else {
           pinCache.delete(id);
+          records.push([id, null]);
         }
       }
+      if (records.length || enabledChanged) sendPatch(records, enabledChanged);
+      if (enabledChanged && enabled) applyAll();
     });
   }
 
-  // React to YouTube's own navigation events (complementary).
+  // React to YouTube's own navigation events + webNavigation SPA signal.
   browser.runtime.onMessage.addListener((msg) => {
     if (msg && msg.type === "ytTitleLockHistoryState") {
-      scheduleDomFallback();
+      applyAll();
+      scheduleResync();
     }
   });
 
@@ -675,24 +777,18 @@ if (typeof document !== "undefined" && typeof browser !== "undefined") {
     document.addEventListener(
       evt,
       () => {
-        scheduleDomFallback();
-        applyWatchTitle();
+        applyAll();
+        scheduleResync();
       },
       true
     );
   }
 
-  window.addEventListener("popstate", () => {
-    scheduleDomFallback();
-  });
+  window.addEventListener("popstate", () => applyAll());
 
-  // First paint fallback. Network interception should handle most cards;
-  // this catches XHR-only surfaces and already-rendered watch titles.
   requestAnimationFrame(() => {
-    requestAnimationFrame(async () => {
-      await migrationReady;
-      scheduleDomFallback();
-      applyWatchTitle();
+    requestAnimationFrame(() => {
+      void migrationReady.then(applyAll);
     });
   });
 }
@@ -706,9 +802,14 @@ if (typeof module !== "undefined" && module.exports) {
     looksLikeTimestampOrDuration,
     isValidTitle,
     isValidThumb,
+    isValidId,
     extractVideoId,
     extractVideoIdFromYtNavigateDetail,
     mergeRecord,
+    learnMerge,
+    parseThumb,
+    buildBaseThumb,
+    thumbUrlToApply,
     selectKeysToEvict,
     PIN_PREFIX,
     PIN_MAX,

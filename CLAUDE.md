@@ -26,37 +26,46 @@ This is a browser extension that pins the first-seen title and thumbnail per You
 
 ## Architecture
 
-### Core Design Philosophy
-The extension avoids fighting YouTube's UI by not attaching continuous MutationObservers to the watch title. Instead, it reacts to YouTube's own page events (`yt-page-data-updated`, `yt-navigate-finish`) with a small bounded-retry safety net for the watch player, and uses debounced subtree observers for grid lists. A single reconciliation engine (`reconcileTarget`) decides "apply the pin" vs "learn the native value" for every surface, so titles and thumbnails are handled homogeneously.
+### Core Design Philosophy (hybrid: interception + DOM safety net)
+Two content scripts cooperate across worlds:
+
+1. **`content-main.js` (MAIN world, `document_start`)** — the anti-flicker layer. It patches page-owned surfaces an isolated script cannot reach — `fetch`, `XMLHttpRequest`, and the `ytInitialData` / `ytInitialPlayerResponse` globals — and rewrites the first-seen title/thumbnail into InnerTube responses **before YouTube renders them**. All pin lookups are **synchronous** against a local cache mirror, so nothing blocks `fetch` resolution and there is no per-response IPC.
+2. **`content.js` (ISOLATED world, `document_start`)** — the storage authority + safety net. It owns `browser.storage.local`, is the single place that persists/prunes/migrates pins, mirrors the cache into the MAIN world, and runs a hardened **DOM reconciler** (apply-only) for surfaces interception missed (Chrome `document_start` races, XHR getter-override failures, already-rendered DOM).
+
+Interception is reliable on Firefox (MAIN `document_start` runs before page scripts); on Chrome the race is not guaranteed, so the DOM reconciler is the guarantee of eventual correctness.
+
+### Cross-world bridge (postMessage)
+- **ISOLATED → MAIN**: `SET_CACHE` (full snapshot on startup) and `PATCH_CACHE` (deltas, incl. `enabled`). Emitted after migration/load and on every `storage.onChanged`.
+- **MAIN → ISOLATED**: `HELLO` (request snapshot; covers either load order) and `LEARN` (fire-and-forget first-seen values). ISOLATED merges LEARN conservatively (`learnMerge`) and never clobbers an existing title or a different thumbnail variant.
+- MAIN updates its mirror **optimistically** on learn so a just-learned pin applies to the next response immediately; the canonical record converges via the commit's `storage.onChanged` → `PATCH_CACHE`.
 
 ### Key Components
 
-**content.js** - Main extension logic:
-- **Storage layer**: One unified record per video, `ytPin:<id> = { t, th, ts }` (title, thumbnail URL, last-write epoch), accessed via `getPins`/`commitPins` (one round-trip each). `mergeRecord` keeps the untouched field on partial writes.
-- **Reconciliation engine**: `reconcileTarget({ videoId, titleEl, thumbEl }, record, opts)` is the only place that pins or learns. Watch passes `thumbEl: null` (the player occupies that space) and an `expectTitle` guard; grid passes both.
-- **Watch/Shorts handling (`applyPlayer`)**: Runs on page events with a generation guard (`playerApplyGen`) + URL re-check so a stale apply never writes after navigation. Learns a title only when the DOM matches `document.title` (settled), except on the final `PLAYER_RETRY_MS` attempt.
-- **Grid/List handling (`applyGridLocks`)**: Debounced subtree observers on `#contents`, miniplayer, Shorts, and `#primary-inner` (excludes `#secondary`). Captures the id per card at scan time and **re-verifies** `cardVideoId(card)` right before writing (YouTube recycles card DOM during scroll). A `WeakMap` skip cache drops already-reconciled, unchanged cards before the storage read.
-- **Video ID extraction**: Prefers YouTube's `yt-navigate-finish` event detail, falls back to URL parsing (`?v=` or Shorts path).
-- **Title text updates**: Mutates text nodes in place (including open shadow subtrees) rather than assigning `textContent`.
-- **LRU pruning**: After ~`PRUNE_CHECK_EVERY` newly learned records, `selectKeysToEvict` trims storage back to `PIN_MAX` by oldest `ts`.
-- **Migration**: One-time fold of legacy `ytTitleLock:` / `ytThumbLock:` keys into `ytPin:` records, gated by `ytPinSchema`; apply passes `await migrationReady`.
+**content-main.js** (MAIN world):
+- **Synchronous apply/learn** (`processEntries`): reads the local mirror, mutates response objects in place, and queues `LEARN` messages. Never awaits.
+- **Interception traps**: `patchFetch` (rebuilds the `Response` only when modified), `patchXHR` (lazy `responseText`/`response` getter overrides so any listener order sees the rewrite; handles `responseType: "json"` in place), `trapWindowProperty` (mutates `ytInitialData`/`ytInitialPlayerResponse` **synchronously in the setter**).
+- **Collection + classification** (`collectVideoEntries`, `classify`): walks InnerTube JSON tracking the wrapping renderer key. Learns titles+thumbs only from canonical **video** renderers, titles-only from **short** renderers, and **skips** playlist/mix/podcast/endscreen. `readVideoId` is strict (exactly 11 chars; playlist `contentId`s rejected).
+- **Thumbnail variants** (`parseThumb`, `buildBaseThumb`, `writeThumbToObj`): pins the A/B variant identity (`_custom_N`), not a frozen URL. Reverting to the original yields clean **param-less** base URLs (never expire); custom variants reuse the stored URL and refresh `sqp`/`rs` when re-seen.
 
-**background.js** - Minimal background script (Firefox) or service worker (Chrome) for extension lifecycle
+**content.js** (ISOLATED world):
+- **Storage layer**: one record per video, `ytPin:<id> = { t, th, ts }`. `learnMerge` (conservative) for bridge learns; `mergeRecord` (permissive) for migration folds. Debounced commit (`scheduleCommit` / `flushCommit`) with LRU pruning (`selectKeysToEvict`).
+- **Cache authority + bridge**: `sendFullCache` / `sendPatch` / `handleLearn`; `storage.onChanged` keeps the cache and the MAIN mirror in sync across tabs.
+- **DOM reconciler** (`reconcileDom`, apply-only): scans grid/sidebar/watch roots; **re-verifies `cardVideoId(card)` before writing** (recycling guard); never cross-applies a horizontal thumbnail onto a Shorts slot; Trusted-Types-safe writes (`setPinnedTitleText` text-node mutation, `setPinnedThumbnail` variant-aware with an `onerror` revert to native).
+- **Watch/Shorts title** (`applyWatchTitle`): event-driven (no continuous observer on the watch title).
+- **Migration**: one-time fold of legacy `ytTitleLock:` / `ytThumbLock:` keys into `ytPin:` records, gated by `ytPinSchema`; all apply paths `await migrationReady`.
 
-### Important Constants
-- `PIN_PREFIX: "ytPin:"` - Storage key prefix for the unified per-video record
-- `PIN_MAX: 5000` - LRU cap on stored video records
-- `PRUNE_CHECK_EVERY: 200` - Newly learned records before a prune scan runs
-- `GRID_DEBOUNCE_MS: 300` - Debounce delay for grid list mutations
-- `GRID_RESYNC_DEBOUNCE_MS: 800` - Delay for resyncing observers after layout changes
-- `NAV_APPLY_DEBOUNCE_MS: 64` - Debounce for navigation-based title application
-- `PLAYER_RETRY_MS: [0, 300]` - Bounded safety-net retries for watch/Shorts (primary trigger is events)
-- `GRID_SCAN_CAP: 800` - Maximum grid anchors to scan per pass
+**background.js** — minimal background script (Firefox) / service worker (Chrome); relays `webNavigation.onHistoryStateUpdated` as a SPA-nav signal.
+
+### Important Constants (content.js)
+- `PIN_PREFIX: "ytPin:"` / `PIN_MAX: 5000` / `PRUNE_CHECK_EVERY: 200` — storage record + LRU.
+- `RECONCILE_DEBOUNCE_MS: 300` — trailing-edge throttle for the DOM reconciler (cannot be starved by continuous mutation).
+- `RESYNC_DEBOUNCE_MS: 800` — re-attach observers after a layout swap.
+- `COMMIT_DEBOUNCE_MS: 500` — min gap between storage commits.
+- `DOM_SCAN_CAP: 200` (cards applied) / `DOM_LINK_CAP: 1500` (anchors examined) per pass.
 
 ### Observer Strategy
-- **Subtree observers** watch `#contents`, miniplayer, Shorts, and `#primary-inner` (not `#secondary`)
-- **App structure observer** watches `ytd-app` childList to resync subtree observers when layout changes
-- **Filtering**: Skips player subtree mutations and comments/live chat under `#primary-inner`
+- **Subtree observers** watch only the infinite-scroll grid feeds (`#contents`, `ytd-shorts`) with a trailing-edge throttle; comments/live chat/player (`#primary-inner`) and the sidebar (`#secondary`) are covered by interception + event-driven reconciles instead.
+- **Resync** (`scheduleResync`) re-attaches observers on `yt-navigate-finish` / `yt-page-data-updated` when YouTube swaps the layout.
 
 ### Chrome vs Firefox Manifests
 - Root `manifest.json` uses Firefox format (`background.scripts`)
@@ -75,22 +84,24 @@ E2E tests use Playwright with Chromium loading the extension as unpacked. Tests 
 
 (Watch pages pin the title only — the player occupies the thumbnail area.)
 
-Pure helpers in `content.js` are also covered by fast `node:test` unit tests (`npm run test:unit`): title/thumbnail validation, video-id extraction, record merge, and LRU eviction.
+Pure helpers in `content.js` and `content-main.js` are covered by fast `node:test` unit tests (`npm run test:unit`): title/thumbnail validation, strict video-id extraction, source classification, thumbnail-variant swap, conservative learn-merge, record merge, and LRU eviction.
 
 Tests require headed browser (extensions don't load in headless mode). For CI, use Xvfb or `npm run test:e2e:ci`.
 
 ## Important Constraints
 
-- **No continuous observers on watch title**: React to `yt-page-data-updated` / `yt-navigate-finish` events (not a live observer) to avoid fighting YouTube's UI and prevent stuck/flickering titles
-- **Generation guards**: Both `applyPlayer` and `applyGridLocks` bump a generation counter and bail if a newer pass started during their `await`; `applyPlayer` also re-checks the URL still matches the captured id
-- **Grid recycling guard**: Re-verify `cardVideoId(card) === capturedId` before writing, because YouTube reuses card DOM nodes for different videos during virtualized scroll
-- **Learn-when-settled (watch)**: Only save a native title that matches `document.title`, so the previous video's title is never pinned under the new id
-- **Exclude #secondary from subtree observers**: Sidebar recommendations mutate constantly; sidebar tiles are still scanned when grid locks run via other triggers
-- **Text node mutation**: Updates text nodes directly rather than replacing `textContent` to preserve component structure
-- **No watch-page thumbnail pin**: The player occupies that area; thumbnails are pinned only in grids/sidebar
-- **Storage record**: One `ytPin:<id> = { t, th, ts }` record per video; LRU-pruned to `PIN_MAX`
-- **Video ID validation**: Uses regex `/[a-zA-Z0-9_-]{11}/` for YouTube video IDs
-- **Unit tests**: Pure helpers are exported from `content.js` under a `module.exports` guard and tested via `npm run test:unit` (`node:test`)
+- **Interception must never block YouTube**: MAIN-world lookups are synchronous against the local mirror; `fetch`/XHR are not held behind any IPC round-trip. Rebuild a `Response` (or override XHR getters) only when a pin actually changed the body.
+- **ISOLATED is the only storage writer**: the MAIN world never touches `browser.storage`; it learns via fire-and-forget `LEARN` and reads via `SET_CACHE`/`PATCH_CACHE`.
+- **Conservative learning (anti-leak)**: `learnMerge` fills only missing fields and refreshes a thumbnail only for the *same* A/B variant — an existing title or a different variant is never clobbered. Learn only from canonical **video**/**short** renderers; **skip** playlist/mix/podcast/endscreen.
+- **Strict video id**: exactly 11 chars (`/^[a-zA-Z0-9_-]{11}$/`); playlist/collection `contentId`s are rejected so a playlist is never pinned as a video.
+- **Thumbnail variants, not frozen URLs**: pin the `_custom_N` identity and preserve each slot's resolution; original-variant pins produce param-less URLs that never expire; a stale custom pin reverts to native via `onerror`.
+- **No Shorts↔video thumbnail cross-apply**: a vertical Shorts thumbnail is never written onto the same video's horizontal cards (titles are still pinned for both).
+- **DOM reconciler is apply-only**: it never learns (learning happens in the interception layer, which sees structured, classified data). Re-verify `cardVideoId(card) === capturedId` before writing (YouTube recycles card DOM during virtualized scroll).
+- **No continuous observer on the watch title**: `applyWatchTitle` is event-driven (`yt-navigate-finish` / `yt-page-data-updated`).
+- **Trusted-Types-safe DOM writes**: text-node mutation and `img.src` only — never `innerHTML` (YouTube enforces Trusted Types).
+- **No watch-page thumbnail pin**: the player occupies that area; thumbnails are pinned only in grids/sidebar.
+- **Storage record**: one `ytPin:<id> = { t, th, ts }` record per video; LRU-pruned to `PIN_MAX`.
+- **Unit tests**: pure helpers are exported from both `content.js` and `content-main.js` under a `module.exports` guard (bootstrap is guarded for non-browser envs) and tested via `npm run test:unit`.
 
 ## Store Submission
 

@@ -14,6 +14,10 @@ const {
   extractVideoId,
   extractVideoIdFromYtNavigateDetail,
   mergeRecord,
+  learnMerge,
+  parseThumb,
+  buildBaseThumb,
+  thumbUrlToApply,
   selectKeysToEvict,
   PIN_PREFIX,
   TENTATIVE_SETTLE_MS,
@@ -99,6 +103,69 @@ test("selectKeysToEvict returns oldest keys over the cap, none when under", () =
   // cap of 1 keeps newest (ts 30 => 'a'), evicts the two oldest (b=10, c=20)
   const evicted = selectKeysToEvict(all, 1);
   assert.deepEqual(evicted.sort(), [`${PIN_PREFIX}b`, `${PIN_PREFIX}c`].sort());
+});
+
+test("isValidThumb requires a /vi/ ytimg path", () => {
+  assert.equal(isValidThumb("https://i.ytimg.com/vi/abc/hqdefault.jpg"), true);
+  assert.equal(isValidThumb("https://i.ytimg.com/vi_webp/abc/hq.webp"), true);
+  assert.equal(isValidThumb("https://i.ytimg.com/an_webp/abc/hq.webp"), false);
+  assert.equal(isValidThumb("https://yt3.ggpht.com/avatar.jpg"), false);
+});
+
+test("thumbUrlToApply reverts custom variants to clean bases, keeps resolution", () => {
+  // Native shows a custom A/B variant; we pinned the original => clean base, same res.
+  assert.equal(
+    thumbUrlToApply(
+      "https://i9.ytimg.com/vi/dQw4w9WgXcQ/mqdefault_custom_3.jpg?sqp=z",
+      "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg"
+    ),
+    "https://i.ytimg.com/vi/dQw4w9WgXcQ/mqdefault.jpg"
+  );
+  // Already the pinned variant => no change.
+  assert.equal(
+    thumbUrlToApply(
+      "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg",
+      "https://i.ytimg.com/vi/dQw4w9WgXcQ/mqdefault.jpg"
+    ),
+    null
+  );
+  // Pinned a custom variant => apply the stored custom URL verbatim.
+  assert.equal(
+    thumbUrlToApply(
+      "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg",
+      "https://i9.ytimg.com/vi/dQw4w9WgXcQ/hqdefault_custom_1.jpg?sqp=q"
+    ),
+    "https://i9.ytimg.com/vi/dQw4w9WgXcQ/hqdefault_custom_1.jpg?sqp=q"
+  );
+});
+
+test("learnMerge never clobbers an existing title or a different thumb variant", () => {
+  const prev = {
+    t: "First Seen Title",
+    th: "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg",
+    ts: 1,
+  };
+  // A later different title must not overwrite the pinned one.
+  const m1 = learnMerge(prev, { t: "A/B Variant Title" });
+  assert.equal(m1.t, "First Seen Title");
+  // A different thumbnail variant must not overwrite the pinned original.
+  const m2 = learnMerge(prev, {
+    th: "https://i9.ytimg.com/vi/dQw4w9WgXcQ/hqdefault_custom_2.jpg?sqp=a",
+  });
+  assert.equal(m2.th, "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg");
+  // Same variant with fresh params IS refreshed (params rotate ~6h).
+  const custom = {
+    t: null,
+    th: "https://i9.ytimg.com/vi/dQw4w9WgXcQ/hqdefault_custom_2.jpg?sqp=old",
+    ts: 1,
+  };
+  const m3 = learnMerge(custom, {
+    th: "https://i9.ytimg.com/vi/dQw4w9WgXcQ/hqdefault_custom_2.jpg?sqp=new",
+  });
+  assert.equal(m3.th, "https://i9.ytimg.com/vi/dQw4w9WgXcQ/hqdefault_custom_2.jpg?sqp=new");
+  // Missing fields are filled.
+  const m4 = learnMerge({ t: null, th: null, ts: 1 }, { t: "Now Learned" });
+  assert.equal(m4.t, "Now Learned");
 });
 
 test("TENTATIVE_SETTLE_MS is at least the grid debounce so the 2-pass gate can settle", () => {
