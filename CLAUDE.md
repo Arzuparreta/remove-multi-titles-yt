@@ -98,6 +98,7 @@ Tests require headed browser (extensions don't load in headless mode). For CI, u
 - **No Shorts↔video thumbnail cross-apply**: a vertical Shorts thumbnail is never written onto the same video's horizontal cards (titles are still pinned for both).
 - **DOM reconciler is apply-only**: it never learns (learning happens in the interception layer, which sees structured, classified data). Re-verify `cardVideoId(card) === capturedId` before writing (YouTube recycles card DOM during virtualized scroll).
 - **No continuous observer on the watch title**: `applyWatchTitle` is event-driven (`yt-navigate-finish` / `yt-page-data-updated`).
+- **Cooperate with title-untranslator extensions**: when a known DOM ownership marker is present, the DOM safety net yields title text while continuing to pin thumbnails. `youtubei/v1/player` titles are never rewritten because that endpoint is also used as a canonical-title fallback by other extensions.
 - **Trusted-Types-safe DOM writes**: text-node mutation and `img.src` only — never `innerHTML` (YouTube enforces Trusted Types).
 - **No watch-page thumbnail pin**: the player occupies that area; thumbnails are pinned only in grids/sidebar.
 - **Storage record**: one `ytPin:<id> = { t, th, ts }` record per video; LRU-pruned to `PIN_MAX`.

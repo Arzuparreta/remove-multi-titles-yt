@@ -46,6 +46,15 @@ const COMMIT_DEBOUNCE_MS = 500;
 const DOM_SCAN_CAP = 200;
 /** Max anchors to examine per DOM pass (comment timestamp links inflate this). */
 const DOM_LINK_CAP = 1500;
+/**
+ * DOM footprint left by a third-party title un-translator (YouTube Anti
+ * Translate and forks). When present it owns the visible title text, so we yield
+ * titles to it and keep only our thumbnail pins (which it never touches).
+ */
+const TITLE_UNTRANSLATOR_MARKERS =
+  'script[data-ytantitranslatesettings],[id^="yt-anti-translate-fake-node"],' +
+  "[data-ytat-untranslated]," +
+  "[data-ytat-untranslated-other],[data-ytat-untranslated-desc]";
 
 /** Legacy constant — kept for unit-test compatibility with the old 2-pass gate. */
 const TENTATIVE_SETTLE_MS = 750;
@@ -99,6 +108,16 @@ function isValidThumb(s) {
 
 function isValidId(s) {
   return typeof s === "string" && YT_ID_STRICT_RE.test(s);
+}
+
+/** Whether another extension has declared ownership of visible title text. */
+function hasExternalTitleOwner(root) {
+  if (!root || typeof root.querySelector !== "function") return false;
+  try {
+    return !!root.querySelector(TITLE_UNTRANSLATOR_MARKERS);
+  } catch {
+    return false;
+  }
 }
 
 function pinKey(id) {
@@ -554,14 +573,14 @@ function cardVideoId(card) {
   }
 }
 
-function applyToCard(card, link, id, rec) {
+function applyToCard(card, link, id, rec, applyTitles) {
   const href = link.getAttribute("href") || "";
   const isShort =
     href.startsWith("/shorts/") ||
     card.nodeName === "YTD-REEL-ITEM-RENDERER" ||
     !!card.closest("ytd-shorts");
 
-  if (isValidTitle(rec.t)) {
+  if (applyTitles && isValidTitle(rec.t)) {
     const titleEl = getGridTitleElement(card, link);
     if (titleEl && currentTitleText(titleEl) !== normalizeTitle(rec.t)) {
       setPinnedTitleText(titleEl, rec.t);
@@ -576,6 +595,11 @@ function applyToCard(card, link, id, rec) {
 async function reconcileDom() {
   await migrationReady;
   if (!enabled) return;
+
+  // A title-untranslator intentionally owns the visible text. Re-applying our
+  // stored title would create an endless MutationObserver ping-pong; thumbnail
+  // pins remain independent and are still reconciled below.
+  const applyTitles = !hasExternalTitleOwner(document);
 
   const roots = [
     "#contents", "ytd-miniplayer", "ytd-shorts",
@@ -608,7 +632,7 @@ async function reconcileDom() {
         if (!rec) continue;
         // Recycling guard: the card must still resolve to this id.
         if (cardVideoId(card) !== id) continue;
-        applyToCard(card, a, id, rec);
+        applyToCard(card, a, id, rec, applyTitles);
         applied++;
       }
     }
@@ -635,6 +659,7 @@ function scheduleReconcile() {
 async function applyWatchTitle() {
   await migrationReady;
   if (!enabled) return;
+  if (hasExternalTitleOwner(document)) return;
 
   const onShorts = location.pathname.startsWith("/shorts/");
   let videoId;
@@ -803,6 +828,7 @@ if (typeof module !== "undefined" && module.exports) {
     isValidTitle,
     isValidThumb,
     isValidId,
+    hasExternalTitleOwner,
     extractVideoId,
     extractVideoIdFromYtNavigateDetail,
     mergeRecord,

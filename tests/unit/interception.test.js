@@ -16,7 +16,20 @@ const {
   readVideoId,
   classify,
   collectVideoEntries,
+  shouldApplyTitlesForUrl,
 } = require(path.resolve(__dirname, "..", "..", "content-main.js"));
+
+test("player responses keep native titles for title-untranslator compatibility", () => {
+  assert.equal(
+    shouldApplyTitlesForUrl("https://www.youtube.com/youtubei/v1/player?prettyPrint=false"),
+    false
+  );
+  assert.equal(
+    shouldApplyTitlesForUrl("https://www.youtube.com/youtubei/v1/browse?prettyPrint=false"),
+    true
+  );
+  assert.equal(shouldApplyTitlesForUrl("https://www.youtube.com/oembed?url=x"), true);
+});
 
 test("readVideoId accepts 11-char ids and rejects playlist contentIds", () => {
   assert.equal(readVideoId({ videoId: "jNQXAC9IVRw" }), "jNQXAC9IVRw");

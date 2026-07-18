@@ -287,7 +287,7 @@
    * Apply pins in place (when `applyInPlace`) and gather newly-seen values.
    * SYNCHRONOUS: reads the local mirror, never awaits.
    */
-  function processEntries(entries, applyInPlace) {
+  function processEntries(entries, applyInPlace, applyTitles = true) {
     if (!enabled || entries.length === 0) return false;
     let modified = false;
     const learn = [];
@@ -298,7 +298,9 @@
 
       if (rec) {
         if (applyInPlace) {
-          if (isValidTitle(rec.t) && writeTitleToObj(e._obj, rec.t)) modified = true;
+          if (applyTitles && isValidTitle(rec.t) && writeTitleToObj(e._obj, rec.t)) {
+            modified = true;
+          }
           if (e.kind === "video" && isValidThumb(rec.th) && writeThumbToObj(e._obj, rec.th)) {
             modified = true;
           }
@@ -397,6 +399,17 @@
     return !!m && ENDPOINT_RE.test(m[1]);
   }
 
+  /**
+   * `player` is also the canonical-title fallback used by title-untranslator
+   * extensions. Keep its title native so our fetch/XHR wrapper cannot feed a
+   * stored A/B title back to those extensions. Other InnerTube surfaces are
+   * presentation payloads and remain eligible for title pinning.
+   */
+  function shouldApplyTitlesForUrl(url) {
+    const m = typeof url === "string" ? url.match(YT_API_RE) : null;
+    return !m || m[1] !== "player";
+  }
+
   function patchFetch() {
     const nativeFetch = window.fetch;
     if (typeof nativeFetch !== "function") return;
@@ -411,7 +424,7 @@
         const json = await response.clone().json();
         const entries = collectVideoEntries(json, MAX_ENTRIES);
         if (entries.length === 0) return response;
-        const modified = processEntries(entries, true);
+        const modified = processEntries(entries, true, shouldApplyTitlesForUrl(url));
         if (!modified) return response;
         return new Response(JSON.stringify(json), {
           status: response.status,
@@ -452,14 +465,19 @@
           if (rt === "json") {
             const obj = respDesc.get.call(xhr);
             const entries = collectVideoEntries(obj, MAX_ENTRIES);
-            if (entries.length) processEntries(entries, true); // mutates obj in place
+            if (entries.length) {
+              processEntries(entries, true, shouldApplyTitlesForUrl(url)); // mutates obj in place
+            }
             return;
           }
           const raw = rtDesc.get.call(xhr);
           if (typeof raw !== "string" || !raw) return;
           const json = JSON.parse(raw);
           const entries = collectVideoEntries(json, MAX_ENTRIES);
-          if (entries.length && processEntries(entries, true)) {
+          if (
+            entries.length &&
+            processEntries(entries, true, shouldApplyTitlesForUrl(url))
+          ) {
             xhr.__ytPinText = JSON.stringify(json);
           }
         } catch {
@@ -498,7 +516,7 @@
     };
   }
 
-  function trapWindowProperty(name) {
+  function trapWindowProperty(name, applyTitles) {
     let stored;
     try {
       Object.defineProperty(window, name, {
@@ -512,7 +530,7 @@
           if (enabled && v && typeof v === "object") {
             try {
               const entries = collectVideoEntries(v, MAX_ENTRIES);
-              if (entries.length) processEntries(entries, true);
+              if (entries.length) processEntries(entries, true, applyTitles);
             } catch {
               /* ignore */
             }
@@ -526,8 +544,10 @@
   }
 
   function installInitialDataTraps() {
-    if (!("ytInitialData" in window)) trapWindowProperty("ytInitialData");
-    if (!("ytInitialPlayerResponse" in window)) trapWindowProperty("ytInitialPlayerResponse");
+    if (!("ytInitialData" in window)) trapWindowProperty("ytInitialData", true);
+    if (!("ytInitialPlayerResponse" in window)) {
+      trapWindowProperty("ytInitialPlayerResponse", false);
+    }
   }
 
   if (typeof window !== "undefined" && typeof XMLHttpRequest !== "undefined") {
@@ -547,6 +567,7 @@
       parseThumb, buildBaseThumb, writeThumbToObj, readThumbFromObj,
       readTitleFromObj, writeTitleToObj,
       readVideoId, classify, collectVideoEntries, mergeMirror,
+      shouldApplyTitlesForUrl,
     };
   }
 })();

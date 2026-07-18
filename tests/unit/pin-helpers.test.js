@@ -11,6 +11,7 @@ const {
   looksLikeTimestampOrDuration,
   isValidTitle,
   isValidThumb,
+  hasExternalTitleOwner,
   extractVideoId,
   extractVideoIdFromYtNavigateDetail,
   mergeRecord,
@@ -43,6 +44,23 @@ test("isValidTitle rejects empty/undefined/timestamps, accepts real titles", () 
   assert.equal(isValidTitle(null), false);
   assert.equal(isValidTitle("12:34"), false);
   assert.equal(isValidTitle("Me at the zoo"), true);
+});
+
+test("hasExternalTitleOwner detects YouTube Anti Translate DOM ownership", () => {
+  let selector = "";
+  assert.equal(
+    hasExternalTitleOwner({
+      querySelector(value) {
+        selector = value;
+        return { nodeName: "SCRIPT" };
+      },
+    }),
+    true
+  );
+  assert.match(selector, /data-ytantitranslatesettings/);
+  assert.match(selector, /yt-anti-translate-fake-node/);
+  assert.equal(hasExternalTitleOwner({ querySelector: () => null }), false);
+  assert.equal(hasExternalTitleOwner(null), false);
 });
 
 test("isValidThumb requires a ytimg.com url", () => {
