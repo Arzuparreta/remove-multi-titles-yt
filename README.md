@@ -1,7 +1,7 @@
 # remove-multi-titles-yt
 
 
-[**Get for Firefox**](https://addons.mozilla.org/en-US/firefox/addon/remove-multi-titles-youtube) | [**Get for Chrome**](https://chromewebstore.google.com/detail/remove-multi-titles-youtu/gahcfhkfmbmfbmchbcepecigldgokkif)
+[**Get for Firefox**](https://addons.mozilla.org/firefox/addon/remove-multi-titles-youtube) | [**Get for Chrome**](https://chromewebstore.google.com/detail/remove-multi-titles-youtu/gahcfhkfmbmfbmchbcepecigldgokkif)
 
 YouTube sometimes A/B tests different titles and thumbnails for the same video. This extension remembers the first title and thumbnail you see for each video and keeps showing that one in the player and in lists (home, subscriptions, search results, related videos, etc.), so you are not bounced between variants or re-clickbaited by a renamed tile.
 
@@ -40,5 +40,3 @@ For normal use, install from Mozilla Add-ons (use the **Get the add-on** image a
 4. Under **Temporary Extensions**, click **Load Temporary Add-on…** and choose **`manifest.json`** in the project directory (Firefox expects `background.scripts`, not `service_worker`, in that file).
 
 Temporary add-ons are removed when Firefox closes; load again if you need it back.
-
-
