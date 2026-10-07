@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Remove Multi Titles (YouTube)",
-  "version": "2.5.0",
+  "version": "3.0.0",
   "author": "Arzuparreta",
   "homepage_url": "https://github.com/Arzuparreta/remove-multi-titles-yt",
   "description": "Pins the first-seen title and thumbnail per video on YouTube (watch, Shorts, and lists) to reduce A/B title and thumbnail flicker.",
@@ -25,11 +25,8 @@
     "default_title": "Remove Multi Titles (YouTube)",
     "default_popup": "popup.html"
   },
-  "permissions": ["storage", "webNavigation"],
+  "permissions": ["storage"],
   "host_permissions": ["*://*.youtube.com/*"],
-  "background": {
-    "scripts": ["background.js"]
-  },
   "content_scripts": [
     {
       "matches": ["*://*.youtube.com/*"],
@@ -39,7 +36,7 @@
     },
     {
       "matches": ["*://*.youtube.com/*"],
-      "js": ["lib/browser-polyfill.min.js", "content.js"],
+      "js": ["content.js"],
       "run_at": "document_start",
       "world": "ISOLATED"
     }

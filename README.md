@@ -3,26 +3,28 @@
 
 [**Get for Firefox**](https://addons.mozilla.org/firefox/addon/remove-multi-titles-youtube) | [**Get for Chrome**](https://chromewebstore.google.com/detail/remove-multi-titles-youtu/gahcfhkfmbmfbmchbcepecigldgokkif)
 
-YouTube sometimes A/B tests different titles and thumbnails for the same video. This extension remembers the first title and thumbnail you see for each video and keeps showing that one in the player and in lists (home, subscriptions, search results, related videos, etc.), so you are not bounced between variants or re-clickbaited by a renamed tile.
+YouTube A/B tests titles and thumbnails ("Test & compare"), auto-translates titles, and creators rename videos after publishing. This extension remembers the first title and thumbnail you see for each video and keeps showing exactly those — in lists (home, subscriptions, search, channel pages, related videos, playlists), on the watch page, in the player, in the tab title, in Shorts and in YouTube Music — so you are not bounced between variants or re-clickbaited by a renamed tile.
 
-It only runs on youtube.com.
+It only runs on youtube.com. Nothing is sent anywhere.
 
 ## How it works
 
-The first time you see a title and thumbnail for a video (watch page, Shorts, or a grid tile), they are saved locally. Later, those same strings are shown again for that video id. Updates run **after navigation** (`yt-navigate-finish`, URL changes) with a few short retries so metadata can mount — there is **no** continuous MutationObserver on the big watch title or thumbnail, which avoided fighting YouTube’s UI. Nothing is sent to a server.
+Instead of fighting YouTube's page after it has rendered, the extension rewrites the data YouTube loads (its InnerTube JSON and the initial page data) before YouTube renders it, so YouTube itself draws the pinned title and thumbnail. That means no flicker and no mix-ups when YouTube recycles cards while you scroll.
 
-## Architecture
+It is built to never get in YouTube's way: pins are looked up synchronously from memory, responses keep streaming (the video starts as soon as YouTube's player data arrives), aborted requests stay aborted, unchanged responses are passed through byte for byte, and anything unexpected is left untouched.
 
 | Area | Behaviour |
 |------|-----------|
-| Watch / Shorts | Pins the **title** on YouTube's own settle signals (`yt-page-data-updated`, `yt-navigate-finish`) with a generation guard + URL re-check, plus a small bounded retry safety net (`PLAYER_RETRY_MS`). A title is only *learned* once the DOM matches `document.title`, so a stale title can't be saved under the wrong video. (The watch player shows the video itself, so no thumbnail is pinned there.) |
-| Lists / grids | Debounced subtree observers on `#contents`, miniplayer, Shorts, and `#primary-inner` (not `#secondary`) so sidebar churn does not constantly re-run pin passes. Sidebar tiles are still included when locks run. Cards are re-verified against their current video id right before writing (YouTube recycles card DOM during scroll), and a per-card skip cache avoids redundant work. Pins both titles and thumbnails. |
-| Video id | YouTube `yt-navigate-finish` detail when present; otherwise URL (`?v=` / Shorts path). |
-| Storage | `browser.storage.local`, one record per video: `ytPin:<id> = { t, th, ts }` (title, thumbnail URL, last-write time). LRU-pruned to `PIN_MAX` (5000) videos. Legacy `ytTitleLock:` / `ytThumbLock:` keys are migrated once on upgrade. |
+| Lists / grids / sidebar | Title and thumbnail pinned from YouTube's JSON (lockups, search results, playlists, Shorts shelves, end screens, autoplay). |
+| Watch page | Title pinned in the heading, the player, the tab title and the description panel, including YouTube's live `updated_metadata` refresh. |
+| Shorts | Title and vertical thumbnail pinned. |
+| Thumbnails | A thumbnail is only replaced when YouTube serves a *different variant* (e.g. `hq720_custom_2.jpg`); sizes and Shorts/landscape art are never mixed. |
+| YouTube Music | Pinned separately (Music shows song titles for the same video ids). |
+| Storage | `browser.storage.local`, one record per video (`ytPin:<id>`), least-recently-seen pruned beyond 5000 videos. The popup shows how many videos are pinned and can clear them. |
 
 ### Install from source (Chrome / Chromium)
 
-Chrome Manifest V3 only allows a **service worker** background. Firefox (and `web-ext` builds for AMO) use **`background.scripts`**, which Chrome rejects—so this repo keeps **Firefox** `manifest.json` at the project root and generates a Chrome bundle.
+The repo root is the Firefox package; `npm run build:chrome-unpacked` copies the same files into a clean folder for Chrome.
 
 1. Download or clone this repo and run `npm ci` (or at least `npm run build:chrome-unpacked`).
 2. Open `chrome://extensions`, enable **Developer mode**, **Load unpacked**.
@@ -37,6 +39,17 @@ For normal use, install from Mozilla Add-ons (use the **Get the add-on** image a
 1. Download or clone this repo.
 2. Open `about:debugging`.
 3. Click **This Firefox** (left sidebar).
-4. Under **Temporary Extensions**, click **Load Temporary Add-on…** and choose **`manifest.json`** in the project directory (Firefox expects `background.scripts`, not `service_worker`, in that file).
+4. Under **Temporary Extensions**, click **Load Temporary Add-on…** and choose **`manifest.json`** in the project directory.
 
 Temporary add-ons are removed when Firefox closes; load again if you need it back.
+
+## Development
+
+```bash
+npm ci
+npm run test:unit      # extractors vs. real captured YouTube JSON, pin store, migration
+npm run test:e2e       # Playwright + Chromium (headless, extension loaded)
+npm run test:firefox   # real Firefox over WebDriver BiDi (add --no-ext for a baseline)
+```
+
+Debug logging: on youtube.com run `localStorage.setItem("ytpin:debug", "1")` in the console and reload.

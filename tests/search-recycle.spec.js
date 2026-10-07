@@ -1,23 +1,20 @@
 /**
  * Regression coverage for the cross-search title/thumbnail leak.
  *
- * Symptom: searching for B after A could show B's thumbnail with A's title
- * (or vice versa) on the same card. Root cause was a single-pass learning
- * path in `applyGridLocks` that persisted stale (t, th) values when YouTube
- * recycled a card and updated the anchor href before the title text /
- * thumbnail image. The 2-pass tentative gate in content.js now requires the
- * (t, th) pair to be observed stable across TENTATIVE_SETTLE_MS before it
- * is committed to storage.
+ * Symptom (v2.2 DOM-based pinning): searching for B after A could show B's
+ * thumbnail with A's title on the same card, because YouTube recycles card
+ * DOM and the extension learned from a half-updated card. Pins are now
+ * learned from YouTube's JSON, where the id and the title live in the same
+ * object, so recycling cannot mix them up — these tests guard that.
  *
- * Test 1 (full reload): defensive — the second search page should not show
- * the first search's first-card title.
+ * Test 1 (full reload): the second search page must not show the first
+ * search's first-card title.
  *
- * Test 2 (SPA search submit): more direct — drives a new search via the
- * masthead input and form submit, which is the in-page flow that triggered
- * the original bug. Skipped defensively if the input cannot be located
- * (consent dialog, locale, layout).
+ * Test 2 (SPA search submit): drives a new search via the masthead form,
+ * the in-page flow that recycles card DOM. Skipped defensively if the input
+ * cannot be located (consent dialog, locale, layout).
  */
-const { test, expect } = require("@playwright/test");
+const { test, expect } = require("./support/fixtures.cjs");
 
 const CARD_SEL = "ytd-video-renderer, ytd-rich-item-renderer";
 
@@ -72,8 +69,7 @@ test.describe("grid pin: search → search does not leak titles across results",
     const tA = await firstCardTitle(page);
     test.skip(!tA, "no card visible in search A");
 
-    // Drive a SPA search via the masthead input + form submit. This is the
-    // in-page flow that recycles card DOM and was triggering the bug.
+    // Drive a SPA search via the masthead input + form submit (recycles card DOM).
     const submitted = await page.evaluate(() => {
       const input = document.querySelector("input[name='search_query']");
       if (!input) return false;
