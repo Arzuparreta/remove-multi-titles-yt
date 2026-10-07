@@ -1,197 +1,198 @@
 /**
- * Unit tests for the pure helpers in content.js (no DOM / no browser storage needed).
+ * Unit tests for the pin store in content.js (no DOM / no browser storage).
  * Run with: npm run test:unit
  */
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
-const path = require("path");
+const path = require("node:path");
 
 const {
+  PIN_PREFIX,
+  SCHEMA_KEY,
+  SCHEMA_VERSION,
+  TOUCH_AFTER_MS,
+  isVideoId,
   normalizeTitle,
-  looksLikeTimestampOrDuration,
   isValidTitle,
   isValidThumb,
-  hasExternalTitleOwner,
-  extractVideoId,
-  extractVideoIdFromYtNavigateDetail,
+  thumbFamily,
+  cacheKey,
   mergeRecord,
-  learnMerge,
-  parseThumb,
-  buildBaseThumb,
-  thumbUrlToApply,
+  resolveItems,
+  forgetThumbs,
+  mergeStored,
   selectKeysToEvict,
-  PIN_PREFIX,
-  TENTATIVE_SETTLE_MS,
+  sanitizeRecord,
+  planMigration,
 } = require(path.resolve(__dirname, "..", "..", "content.js"));
 
-test("normalizeTitle collapses whitespace and trims", () => {
+const A = "dQw4w9WgXcQ";
+const B = "jNQXAC9IVRw";
+const C = "ab8KjD1hDak";
+const TH = (id, name = "hqdefault") => `https://i.ytimg.com/vi/${id}/${name}.jpg`;
+
+test("normalizeTitle / isValidTitle", () => {
   assert.equal(normalizeTitle("  a\n  b\t c "), "a b c");
   assert.equal(normalizeTitle(null), "");
-  assert.equal(normalizeTitle(undefined), "");
-});
-
-test("looksLikeTimestampOrDuration flags bare time strings", () => {
-  assert.equal(looksLikeTimestampOrDuration("3:21"), true);
-  assert.equal(looksLikeTimestampOrDuration("1:02:03"), true);
-  assert.equal(looksLikeTimestampOrDuration(""), true);
-  assert.equal(looksLikeTimestampOrDuration("Real Title"), false);
-});
-
-test("isValidTitle rejects empty/undefined/timestamps, accepts real titles", () => {
-  assert.equal(isValidTitle(""), false);
-  assert.equal(isValidTitle("   "), false);
-  assert.equal(isValidTitle("undefined"), false);
-  assert.equal(isValidTitle(null), false);
-  assert.equal(isValidTitle("12:34"), false);
+  for (const bad of ["", "   ", "undefined", null, 42, "12:34", "1:02:03", "x".repeat(501)]) {
+    assert.equal(isValidTitle(bad), false, String(bad));
+  }
   assert.equal(isValidTitle("Me at the zoo"), true);
 });
 
-test("hasExternalTitleOwner detects YouTube Anti Translate DOM ownership", () => {
-  let selector = "";
-  assert.equal(
-    hasExternalTitleOwner({
-      querySelector(value) {
-        selector = value;
-        return { nodeName: "SCRIPT" };
-      },
-    }),
-    true
-  );
-  assert.match(selector, /data-ytantitranslatesettings/);
-  assert.match(selector, /yt-anti-translate-fake-node/);
-  assert.equal(hasExternalTitleOwner({ querySelector: () => null }), false);
-  assert.equal(hasExternalTitleOwner(null), false);
+test("isVideoId is anchored", () => {
+  assert.equal(isVideoId(A), true);
+  assert.equal(isVideoId(`RD${A}`), false);
+  assert.equal(isVideoId("abc"), false);
 });
 
-test("isValidThumb requires a ytimg.com url", () => {
-  assert.equal(isValidThumb("https://i.ytimg.com/vi/abc/hq.jpg"), true);
+test("isValidThumb / thumbFamily", () => {
+  assert.equal(isValidThumb(TH(A)), true);
+  assert.equal(isValidThumb(`https://i.ytimg.com/vi_lc/${A}/hq720_es.jpg?sqp=x`), true);
+  assert.equal(isValidThumb("https://yt3.ggpht.com/avatar=s48"), false);
   assert.equal(isValidThumb("https://example.com/x.jpg"), false);
-  assert.equal(isValidThumb(null), false);
   assert.equal(isValidThumb(123), false);
+  assert.equal(thumbFamily(TH(A, "hq720_custom_2")), "h");
+  assert.equal(thumbFamily(TH(A, "sardefault")), "v");
+  assert.equal(thumbFamily(TH(A, "oar2")), "v");
+  assert.equal(thumbFamily(TH(A, "frame0")), "f");
 });
 
-test("extractVideoId handles watch, shorts, youtu.be, embed", () => {
-  assert.equal(
-    extractVideoId("https://www.youtube.com/watch?v=jNQXAC9IVRw"),
-    "jNQXAC9IVRw"
-  );
-  assert.equal(
-    extractVideoId("https://www.youtube.com/shorts/dQw4w9WgXcQ"),
-    "dQw4w9WgXcQ"
-  );
-  assert.equal(extractVideoId("https://youtu.be/jNQXAC9IVRw"), "jNQXAC9IVRw");
-  assert.equal(
-    extractVideoId("https://www.youtube.com/embed/jNQXAC9IVRw"),
-    "jNQXAC9IVRw"
-  );
-  assert.equal(extractVideoId("https://example.com/watch?v=jNQXAC9IVRw"), null);
+test("mergeRecord keeps untouched fields and stamps ts", () => {
+  const merged = mergeRecord({ t: "old", th: TH(A), tv: null, ts: 1 }, { t: "new" }, 99);
+  assert.deepEqual(merged, { t: "new", th: TH(A), tv: null, ts: 99 });
+  assert.deepEqual(mergeRecord(null, { tv: TH(A, "sardefault") }, 5), { t: null, th: null, tv: TH(A, "sardefault"), ts: 5 });
 });
 
-test("extractVideoIdFromYtNavigateDetail reads endpoint payloads", () => {
-  assert.equal(
-    extractVideoIdFromYtNavigateDetail({
-      endpoint: { watchEndpoint: { videoId: "jNQXAC9IVRw" } },
-    }),
-    "jNQXAC9IVRw"
+test("resolveItems learns first-seen values and returns pins", () => {
+  const cache = new Map();
+  const { pins, dirty } = resolveItems(cache, [{ id: A, learn: true, t: "Title A", th: TH(A), fam: "h" }], "", 1000);
+  assert.deepEqual(pins[A], { t: "Title A", th: TH(A), tv: null });
+  assert.deepEqual(dirty, [A]);
+  assert.equal(cache.get(A).ts, 1000);
+});
+
+test("resolveItems: within one query the first occurrence of an id wins", () => {
+  const cache = new Map();
+  const { pins } = resolveItems(
+    cache,
+    [
+      { id: A, learn: true, t: "First" },
+      { id: A, learn: true, t: "Second" },
+    ],
+    "",
+    1
   );
-  assert.equal(extractVideoIdFromYtNavigateDetail(null), null);
-  assert.equal(extractVideoIdFromYtNavigateDetail({}), null);
+  assert.equal(pins[A].t, "First");
+  assert.equal(cache.get(A).t, "First");
 });
 
-test("mergeRecord preserves the other field and refreshes ts", () => {
-  const before = Date.now();
-  const merged = mergeRecord({ t: "old", th: "https://i.ytimg.com/x.jpg", ts: 1 }, { t: "new" });
-  assert.equal(merged.t, "new");
-  assert.equal(merged.th, "https://i.ytimg.com/x.jpg"); // untouched
-  assert.ok(merged.ts >= before);
-
-  const fresh = mergeRecord(null, { th: "https://i.ytimg.com/y.jpg" });
-  assert.equal(fresh.t, null);
-  assert.equal(fresh.th, "https://i.ytimg.com/y.jpg");
+test("resolveItems never overwrites an existing pin and never learns from apply-only items", () => {
+  const cache = new Map([[A, { t: "Pinned", th: TH(A), tv: null, ts: 10 }]]);
+  const { pins, dirty } = resolveItems(
+    cache,
+    [
+      { id: A, learn: true, t: "A/B variant", th: TH(A, "hqdefault_custom_2"), fam: "h" },
+      { id: B, t: "Up next label" },
+    ],
+    "",
+    20
+  );
+  assert.deepEqual(pins[A], { t: "Pinned", th: TH(A), tv: null });
+  assert.equal(pins[B], undefined);
+  assert.equal(cache.has(B), false);
+  assert.deepEqual(dirty, []);
 });
 
-test("selectKeysToEvict returns oldest keys over the cap, none when under", () => {
+test("resolveItems fills a missing field and keeps thumbnail families apart", () => {
+  const cache = new Map([[A, { t: "Pinned", th: null, tv: null, ts: 10 }]]);
+  resolveItems(cache, [{ id: A, learn: true, th: TH(A, "sardefault"), fam: "v" }], "", 20);
+  assert.equal(cache.get(A).tv, TH(A, "sardefault"));
+  assert.equal(cache.get(A).th, null);
+  // A wrong family claim or a raw frame is never stored.
+  resolveItems(cache, [{ id: A, learn: true, th: TH(A, "frame0"), fam: "h" }], "", 30);
+  assert.equal(cache.get(A).th, null);
+});
+
+test("resolveItems refreshes the LRU timestamp at most once a day", () => {
+  const cache = new Map([[A, { t: "Pinned", th: null, tv: null, ts: 0 }]]);
+  let r = resolveItems(cache, [{ id: A }], "", TOUCH_AFTER_MS + 1);
+  assert.deepEqual(r.dirty, [A]);
+  assert.equal(cache.get(A).ts, TOUCH_AFTER_MS + 1);
+  r = resolveItems(cache, [{ id: A }], "", TOUCH_AFTER_MS + 2);
+  assert.deepEqual(r.dirty, []);
+});
+
+test("resolveItems keeps YouTube Music pins in their own namespace", () => {
+  const cache = new Map([[A, { t: "Video title", th: null, tv: null, ts: 1 }]]);
+  const { pins } = resolveItems(cache, [{ id: A, learn: true, t: "Song title" }], "m", 2);
+  assert.equal(pins[A].t, "Song title");
+  assert.equal(cache.get(cacheKey("m", A)).t, "Song title");
+  assert.equal(cache.get(A).t, "Video title");
+});
+
+test("resolveItems ignores malformed items", () => {
+  const cache = new Map();
+  const { pins } = resolveItems(cache, [null, { id: "RDxx" }, { id: A, learn: true, t: 5, th: "javascript:1", fam: "h" }], "", 1);
+  assert.deepEqual(pins, {});
+  assert.equal(cache.size, 0);
+});
+
+test("mergeStored: values already in storage win (first write wins across tabs)", () => {
+  const mine = { t: "Mine", th: TH(A), tv: null, ts: 50 };
+  assert.deepEqual(mergeStored(undefined, mine), { t: "Mine", th: TH(A), tv: null, ts: 50 });
+  assert.deepEqual(mergeStored({ t: "Theirs", th: null, ts: 70 }, mine), { t: "Theirs", th: TH(A), tv: null, ts: 70 });
+});
+
+test("forgetThumbs drops a broken thumbnail pin, and the store does not resurrect it", () => {
+  const broken = TH(A, "hq720_custom_2");
+  const cache = new Map([[A, { t: "Pinned", th: broken, tv: TH(A, "sardefault"), ts: 1 }]]);
+  assert.deepEqual(forgetThumbs(cache, [{ id: A, fam: "h" }, { id: B, fam: "h" }, { id: "bad" }], "", 9), [A]);
+  assert.deepEqual(cache.get(A), { t: "Pinned", th: null, tv: TH(A, "sardefault"), ts: 9 });
+
+  const stored = { t: "Pinned", th: broken, tv: TH(A, "sardefault"), ts: 1 };
+  assert.equal(mergeStored(stored, cache.get(A), new Set(["th"])).th, null);
+  assert.equal(mergeStored(stored, cache.get(A)).th, broken, "without the forgotten flag storage wins");
+});
+
+test("selectKeysToEvict drops the least recently seen", () => {
+  const cache = new Map([
+    ["a", { ts: 30 }],
+    ["b", { ts: 10 }],
+    ["c", { ts: 20 }],
+  ]);
+  assert.deepEqual(selectKeysToEvict(cache, 5), []);
+  assert.deepEqual(selectKeysToEvict(cache, 1).sort(), ["b", "c"]);
+});
+
+test("sanitizeRecord", () => {
+  assert.equal(sanitizeRecord(null), null);
+  assert.deepEqual(sanitizeRecord({ t: "  T  ", th: TH(A, "frame0"), ts: 3 }), { t: "T", th: null, tv: null, ts: 3 });
+  assert.deepEqual(sanitizeRecord({ t: null, th: TH(A, "oardefault") }), { t: null, th: null, tv: TH(A, "oardefault"), ts: 0 });
+});
+
+test("planMigration v3 cleans v2.4 data", () => {
   const all = {
-    other: "ignored",
-    [`${PIN_PREFIX}a`]: { t: "a", ts: 30 },
-    [`${PIN_PREFIX}b`]: { t: "b", ts: 10 },
-    [`${PIN_PREFIX}c`]: { t: "c", ts: 20 },
+    ytPinEnabled: false,
+    ytPinSchema: 2,
+    [`${PIN_PREFIX}${A}`]: { t: "Real title A", th: TH(A), ts: 5 },
+    [`${PIN_PREFIX}RDdQw4w9WgXcQ`]: { t: "Mix - Rick Astley", th: TH(A), ts: 5 },
+    [`${PIN_PREFIX}${B}`]: { t: "A continuación", th: TH(B, "frame0"), ts: 5 },
+    [`${PIN_PREFIX}${C}`]: { t: "A continuación", th: TH(C), ts: 5 },
+    [`${PIN_PREFIX}zzzzzzzzzzz`]: { t: "A continuación", th: null, ts: 5 },
+    "ytTitleLock:Xy3_4-abcde": "Legacy title",
+    "ytThumbLock:Xy3_4-abcde": TH("Xy3_4-abcde"),
   };
-  assert.deepEqual(selectKeysToEvict(all, 5), []); // under cap
-  // cap of 1 keeps newest (ts 30 => 'a'), evicts the two oldest (b=10, c=20)
-  const evicted = selectKeysToEvict(all, 1);
-  assert.deepEqual(evicted.sort(), [`${PIN_PREFIX}b`, `${PIN_PREFIX}c`].sort());
-});
+  const { set, remove } = planMigration(all);
 
-test("isValidThumb requires a /vi/ ytimg path", () => {
-  assert.equal(isValidThumb("https://i.ytimg.com/vi/abc/hqdefault.jpg"), true);
-  assert.equal(isValidThumb("https://i.ytimg.com/vi_webp/abc/hq.webp"), true);
-  assert.equal(isValidThumb("https://i.ytimg.com/an_webp/abc/hq.webp"), false);
-  assert.equal(isValidThumb("https://yt3.ggpht.com/avatar.jpg"), false);
-});
-
-test("thumbUrlToApply reverts custom variants to clean bases, keeps resolution", () => {
-  // Native shows a custom A/B variant; we pinned the original => clean base, same res.
-  assert.equal(
-    thumbUrlToApply(
-      "https://i9.ytimg.com/vi/dQw4w9WgXcQ/mqdefault_custom_3.jpg?sqp=z",
-      "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg"
-    ),
-    "https://i.ytimg.com/vi/dQw4w9WgXcQ/mqdefault.jpg"
-  );
-  // Already the pinned variant => no change.
-  assert.equal(
-    thumbUrlToApply(
-      "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg",
-      "https://i.ytimg.com/vi/dQw4w9WgXcQ/mqdefault.jpg"
-    ),
-    null
-  );
-  // Pinned a custom variant => apply the stored custom URL verbatim.
-  assert.equal(
-    thumbUrlToApply(
-      "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg",
-      "https://i9.ytimg.com/vi/dQw4w9WgXcQ/hqdefault_custom_1.jpg?sqp=q"
-    ),
-    "https://i9.ytimg.com/vi/dQw4w9WgXcQ/hqdefault_custom_1.jpg?sqp=q"
-  );
-});
-
-test("learnMerge never clobbers an existing title or a different thumb variant", () => {
-  const prev = {
-    t: "First Seen Title",
-    th: "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg",
-    ts: 1,
-  };
-  // A later different title must not overwrite the pinned one.
-  const m1 = learnMerge(prev, { t: "A/B Variant Title" });
-  assert.equal(m1.t, "First Seen Title");
-  // A different thumbnail variant must not overwrite the pinned original.
-  const m2 = learnMerge(prev, {
-    th: "https://i9.ytimg.com/vi/dQw4w9WgXcQ/hqdefault_custom_2.jpg?sqp=a",
-  });
-  assert.equal(m2.th, "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg");
-  // Same variant with fresh params IS refreshed (params rotate ~6h).
-  const custom = {
-    t: null,
-    th: "https://i9.ytimg.com/vi/dQw4w9WgXcQ/hqdefault_custom_2.jpg?sqp=old",
-    ts: 1,
-  };
-  const m3 = learnMerge(custom, {
-    th: "https://i9.ytimg.com/vi/dQw4w9WgXcQ/hqdefault_custom_2.jpg?sqp=new",
-  });
-  assert.equal(m3.th, "https://i9.ytimg.com/vi/dQw4w9WgXcQ/hqdefault_custom_2.jpg?sqp=new");
-  // Missing fields are filled.
-  const m4 = learnMerge({ t: null, th: null, ts: 1 }, { t: "Now Learned" });
-  assert.equal(m4.t, "Now Learned");
-});
-
-test("TENTATIVE_SETTLE_MS is at least the grid debounce so the 2-pass gate can settle", () => {
-  // GRID_DEBOUNCE_MS lives in content.js (300). The 2-pass verification timer
-  // must run after the debounce, otherwise it can re-read a card that has
-  // not yet finished YouTube's DOM update. Keep this a hard lower bound.
-  assert.ok(
-    typeof TENTATIVE_SETTLE_MS === "number" && TENTATIVE_SETTLE_MS >= 300,
-    `TENTATIVE_SETTLE_MS must be a number >= 300 (got ${TENTATIVE_SETTLE_MS})`
-  );
+  assert.equal(set[SCHEMA_KEY], SCHEMA_VERSION);
+  assert.equal(set.ytPinEnabled, undefined, "unrelated keys untouched");
+  assert.equal(set[`${PIN_PREFIX}${A}`], undefined, "clean records are not rewritten");
+  assert.ok(!remove.includes(`${PIN_PREFIX}${A}`));
+  assert.ok(remove.includes(`${PIN_PREFIX}RDdQw4w9WgXcQ`), "playlist/mix ids removed");
+  assert.ok(remove.includes(`${PIN_PREFIX}${B}`), "label title + frame0 → nothing left");
+  assert.ok(remove.includes(`${PIN_PREFIX}zzzzzzzzzzz`));
+  assert.deepEqual(set[`${PIN_PREFIX}${C}`], { t: null, th: TH(C), tv: null, ts: 5 }, "shared label dropped, thumb kept");
+  assert.deepEqual(set[`${PIN_PREFIX}Xy3_4-abcde`], { t: "Legacy title", th: TH("Xy3_4-abcde"), tv: null, ts: 0 });
+  assert.ok(remove.includes("ytTitleLock:Xy3_4-abcde") && remove.includes("ytThumbLock:Xy3_4-abcde"));
 });

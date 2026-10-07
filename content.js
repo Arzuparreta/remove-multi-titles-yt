@@ -1,844 +1,385 @@
 /**
- * Pins the first-seen title and thumbnail per YouTube video to prevent
- * A/B-test flicker.
+ * ISOLATED-world half of the extension: owns the pin store.
  *
- * Two content scripts cooperate:
- *  - `content-main.js` runs in YouTube's MAIN world and rewrites InnerTube
- *    responses (`fetch` / XHR / `ytInitialData`) before they render. That is the
- *    anti-flicker path.
- *  - This script (ISOLATED world) owns `browser.storage.local`. It is the single
- *    authority for the pin cache: it mirrors the cache into the MAIN world
- *    (SET_CACHE / PATCH_CACHE), absorbs newly learned values from MAIN (LEARN),
- *    and runs a hardened DOM reconciler as a safety net for surfaces the
- *    interception missed (Chrome document_start races, XHR getter-override
- *    failures, already-rendered DOM).
+ * content-main.js (MAIN world) extracts video entries from YouTube's JSON and
+ * asks this script, through a synchronous CustomEvent, which pins apply. This
+ * script answers from an in-memory cache, learns first-seen values, and
+ * persists them to browser.storage in the background.
  *
- * Storage: one record per video, `ytPin:<id> = { t, th, ts }`. LRU-pruned to
- * PIN_MAX.
+ * Storage: one record per video, `ytPin:<id> = { t, th, tv, ts }`
+ *   t   first-seen title
+ *   th  first-seen landscape thumbnail URL
+ *   tv  first-seen vertical (Shorts) thumbnail URL
+ *   ts  last time the video was seen (LRU)
+ * YouTube Music uses its own namespace (`ytPin:m:<id>`): it shows song titles
+ * for the same video ids, so its pins must not mix with youtube.com's.
  */
-
-/* ------------------------------------------------------------------ *
- * Constants
- * ------------------------------------------------------------------ */
 
 const PIN_PREFIX = "ytPin:";
 const ENABLED_KEY = "ytPinEnabled";
 const SCHEMA_KEY = "ytPinSchema";
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 const LEGACY_TITLE_PREFIX = "ytTitleLock:";
 const LEGACY_THUMB_PREFIX = "ytThumbLock:";
 
 const PIN_MAX = 5000;
-const PRUNE_CHECK_EVERY = 200;
+/** Prune only once the cache exceeds PIN_MAX by this much (hysteresis). */
+const PRUNE_SLACK = 250;
+/** Refresh a record's LRU timestamp at most this often. */
+const TOUCH_AFTER_MS = 24 * 60 * 60 * 1000;
+const COMMIT_DEBOUNCE_MS = 1000;
+/** Migration: a title pinned for this many videos is a UI label, not a title. */
+const SHARED_TITLE_LIMIT = 3;
+const MAX_QUERY_ITEMS = 5000;
 
-const YT_ID_RE = /[a-zA-Z0-9_-]{11}/;
-const YT_ID_STRICT_RE = /^[a-zA-Z0-9_-]{11}$/;
-const PAGE_BRIDGE_SOURCE = "yt-pin-main"; // messages FROM the MAIN world
-const CONTENT_BRIDGE_SOURCE = "yt-pin-content"; // messages WE send
-
-/** DOM reconciler debounce (apply-only safety net, never learns). */
-const RECONCILE_DEBOUNCE_MS = 300;
-/** Delay before re-attaching observers after a layout swap. */
-const RESYNC_DEBOUNCE_MS = 800;
-/** Minimum ms between storage commits after learning new entries. */
-const COMMIT_DEBOUNCE_MS = 500;
-/** Max cards to reconcile per DOM pass. */
-const DOM_SCAN_CAP = 200;
-/** Max anchors to examine per DOM pass (comment timestamp links inflate this). */
-const DOM_LINK_CAP = 1500;
-/**
- * DOM footprint left by a third-party title un-translator (YouTube Anti
- * Translate and forks). When present it owns the visible title text, so we yield
- * titles to it and keep only our thumbnail pins (which it never touches).
- */
-const TITLE_UNTRANSLATOR_MARKERS =
-  'script[data-ytantitranslatesettings],[id^="yt-anti-translate-fake-node"],' +
-  "[data-ytat-untranslated]," +
-  "[data-ytat-untranslated-other],[data-ytat-untranslated-desc]";
-
-/** Legacy constant — kept for unit-test compatibility with the old 2-pass gate. */
-const TENTATIVE_SETTLE_MS = 750;
-
-// --- state ---
-
-/** In-memory pin cache: Map<videoId, {t, th, ts}>. Authoritative in this world. */
-const pinCache = new Map();
-/** Full records queued for the next debounced storage write. */
-const pendingWrites = new Map();
-let commitTimer = null;
-let learnedSincePruneCheck = 0;
-
-let reconcileTimer = null;
-let resyncTimer = null;
-let migrationReady = Promise.resolve();
-let cacheReady = false;
-
-/** Master on/off switch, controlled from the toolbar popup. Default on. */
-let enabled = true;
+const EVT_QUERY = "ytpin:q";
+const EVT_ANSWER = "ytpin:a";
+const EVT_STATE = "ytpin:state";
 
 /* ------------------------------------------------------------------ *
- * Pure helpers (no DOM / no storage).
+ * Pure helpers (exported for unit tests).
  * ------------------------------------------------------------------ */
 
+const VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
+const CACHE_KEY_RE = /^(?:m:)?[A-Za-z0-9_-]{11}$/;
+
+function isVideoId(s) {
+  return typeof s === "string" && VIDEO_ID_RE.test(s);
+}
+
 function normalizeTitle(s) {
-  return String(s || "")
+  return String(s ?? "")
     .replace(/\s+/g, " ")
     .trim();
 }
 
-function looksLikeTimestampOrDuration(s) {
-  const t = normalizeTitle(s);
-  if (!t) return true;
-  if (/^\d{1,3}:\d{2}:\d{2}$/.test(t)) return true;
-  if (/^\d{1,2}:\d{2}$/.test(t)) return true;
-  return false;
-}
-
 function isValidTitle(s) {
-  if (s === undefined || s === null) return false;
-  const t = normalizeTitle(String(s));
-  if (!t || t === "undefined") return false;
-  if (looksLikeTimestampOrDuration(t)) return false;
+  if (typeof s !== "string") return false;
+  const t = normalizeTitle(s);
+  if (!t || t === "undefined" || t.length > 500) return false;
+  if (/^\d{1,3}:\d{2}(:\d{2})?$/.test(t)) return false;
   return true;
 }
 
 function isValidThumb(s) {
-  return typeof s === "string" && s.includes("ytimg.com") && /\/vi(_webp)?\//.test(s);
+  return typeof s === "string" && s.length < 1000 && /^https:\/\/i\d?\.ytimg\.com\/vi(?:_[a-z]+)*\//.test(s);
 }
 
-function isValidId(s) {
-  return typeof s === "string" && YT_ID_STRICT_RE.test(s);
+/** "h" landscape, "v" vertical Shorts art, "f" raw video frame (never a pin). */
+function thumbFamily(url) {
+  const name = /\/([^/?#.]+)\.(?:jpg|webp)(?:[?#]|$)/i.exec(url)?.[1] || "";
+  if (/^frame\d/.test(name)) return "f";
+  if (/^(oar|sar)/.test(name)) return "v";
+  return "h";
 }
 
-/** Whether another extension has declared ownership of visible title text. */
-function hasExternalTitleOwner(root) {
-  if (!root || typeof root.querySelector !== "function") return false;
-  try {
-    return !!root.querySelector(TITLE_UNTRANSLATOR_MARKERS);
-  } catch {
-    return false;
-  }
+function cacheKey(ns, id) {
+  return ns ? `${ns}:${id}` : id;
 }
 
-function pinKey(id) {
-  return `${PIN_PREFIX}${id}`;
-}
-
-/** Permissive merge used by migration / cache folds (keeps untouched fields). */
-function mergeRecord(prev, patch) {
-  const next = {
-    t: prev && typeof prev.t === "string" ? prev.t : null,
-    th: prev && typeof prev.th === "string" ? prev.th : null,
-    ts: Date.now(),
-  };
-  if (patch && typeof patch.t === "string" && patch.t) next.t = patch.t;
-  if (patch && typeof patch.th === "string" && patch.th) next.th = patch.th;
-  return next;
-}
-
-/**
- * Split a ytimg URL into stable parts. Mirror of content-main.js parseThumb.
- * The A/B variance lives in the `_custom_N` suffix; resolution and volatile
- * `sqp`/`rs` params are orthogonal.
- */
-function parseThumb(url) {
-  if (typeof url !== "string") return null;
-  const m = url.match(
-    /\/vi(_webp)?\/([a-zA-Z0-9_-]{11})\/([a-z0-9]+?)(?:_custom_(\d+))?\.(jpg|webp|png)/i
-  );
-  if (!m) return null;
+function mergeRecord(prev, patch, now = Date.now()) {
   return {
-    webp: !!m[1],
-    id: m[2],
-    res: m[3],
-    variant: m[4] ? `_custom_${m[4]}` : "",
-    ext: m[5],
+    t: patch.t ?? prev?.t ?? null,
+    th: patch.th ?? prev?.th ?? null,
+    tv: patch.tv ?? prev?.tv ?? null,
+    ts: now,
   };
-}
-
-/** Clean, param-less base thumbnail URL — never expires. */
-function buildBaseThumb(id, res, webp) {
-  return `https://i.ytimg.com/${webp ? "vi_webp" : "vi"}/${id}/${res}.${webp ? "webp" : "jpg"}`;
 }
 
 /**
- * Conservative learn merge: fill missing fields only, and refresh a thumbnail's
- * volatile params only when it is the *same* A/B variant. Never clobbers an
- * existing title or a different thumbnail variant (that would be a leak).
+ * Resolves a bridge query against the cache. Learns first-seen values from
+ * items flagged `learn` (the first occurrence of an id wins), refreshes LRU
+ * timestamps, and returns the pins for every known id plus the cache keys
+ * that need persisting.
  */
-function learnMerge(prev, patch) {
-  const next = {
-    t: prev && typeof prev.t === "string" ? prev.t : null,
-    th: prev && typeof prev.th === "string" ? prev.th : null,
-    ts: Date.now(),
-  };
-  if (!next.t && isValidTitle(patch.t)) next.t = normalizeTitle(patch.t);
-  if (isValidThumb(patch.th)) {
-    if (!next.th) {
-      next.th = patch.th;
-    } else if (next.th !== patch.th) {
-      const pv = parseThumb(next.th);
-      const pe = parseThumb(patch.th);
-      if (pv && pe && pv.variant && pv.variant === pe.variant) next.th = patch.th;
+function resolveItems(cache, items, ns, now = Date.now()) {
+  const pins = {};
+  const dirty = [];
+  for (const it of items) {
+    if (!it || !isVideoId(it.id)) continue;
+    const key = cacheKey(ns, it.id);
+    const rec = cache.get(key) || null;
+    let next = rec;
+    if (it.learn === true) {
+      const patch = {};
+      if (!isValidTitle(rec?.t) && isValidTitle(it.t)) patch.t = normalizeTitle(it.t);
+      if (isValidThumb(it.th)) {
+        if (it.fam === "h" && !rec?.th && thumbFamily(it.th) === "h") patch.th = it.th;
+        else if (it.fam === "v" && !rec?.tv && thumbFamily(it.th) === "v") patch.tv = it.th;
+      }
+      if (patch.t || patch.th || patch.tv) next = mergeRecord(rec, patch, now);
     }
+    if (next && next === rec && now - (rec.ts || 0) > TOUCH_AFTER_MS) next = { ...rec, ts: now };
+    if (next !== rec) {
+      cache.set(key, next);
+      dirty.push(key);
+    }
+    if (next && !(it.id in pins)) pins[it.id] = { t: next.t ?? null, th: next.th ?? null, tv: next.tv ?? null };
   }
-  return next;
+  return { pins, dirty };
 }
 
-function selectKeysToEvict(allObj, max) {
-  const entries = [];
-  for (const k in allObj) {
+/**
+ * Drops thumbnail pins that failed to load (`fam` "h" → th, "v" → tv), so the
+ * next response shows and re-learns YouTube's current thumbnail.
+ */
+function forgetThumbs(cache, forget, ns, now = Date.now()) {
+  const dirty = [];
+  for (const f of forget) {
+    if (!f || !isVideoId(f.id)) continue;
+    const key = cacheKey(ns, f.id);
+    const rec = cache.get(key);
+    const field = f.fam === "v" ? "tv" : "th";
+    if (!rec || !rec[field]) continue;
+    cache.set(key, { ...rec, [field]: null, ts: now });
+    dirty.push(key);
+  }
+  return dirty;
+}
+
+/**
+ * First write wins per field: values already in storage beat ours, except
+ * thumbnails this tab just forgot because they no longer load.
+ */
+function mergeStored(stored, mine, forgotten) {
+  const s = stored && typeof stored === "object" ? stored : {};
+  const thumb = (field) =>
+    forgotten?.has(field) ? mine[field] ?? null : isValidThumb(s[field]) ? s[field] : mine[field] ?? null;
+  return {
+    t: isValidTitle(s.t) ? s.t : mine.t ?? null,
+    th: thumb("th"),
+    tv: thumb("tv"),
+    ts: Math.max(Number(s.ts) || 0, Number(mine.ts) || 0),
+  };
+}
+
+/** Oldest cache keys (by `ts`) to drop so that `max` remain. */
+function selectKeysToEvict(cache, max) {
+  if (cache.size <= max) return [];
+  return [...cache.entries()]
+    .sort((a, b) => (a[1]?.ts || 0) - (b[1]?.ts || 0))
+    .slice(0, cache.size - max)
+    .map((e) => e[0]);
+}
+
+/** Cleans one stored record; null when nothing usable is left. */
+function sanitizeRecord(v) {
+  if (!v || typeof v !== "object") return null;
+  const rec = {
+    t: isValidTitle(v.t) ? normalizeTitle(v.t) : null,
+    th: null,
+    tv: isValidThumb(v.tv) && thumbFamily(v.tv) === "v" ? v.tv : null,
+    ts: Number(v.ts) || 0,
+  };
+  if (isValidThumb(v.th)) {
+    const fam = thumbFamily(v.th);
+    if (fam === "h") rec.th = v.th;
+    else if (fam === "v" && !rec.tv) rec.tv = v.th;
+  }
+  return rec;
+}
+
+function sameRecord(a, b) {
+  return (a.t ?? null) === (b.t ?? null) && (a.th ?? null) === (b.th ?? null) && (a.tv ?? null) === (b.tv ?? null) && (a.ts || 0) === (b.ts || 0);
+}
+
+/**
+ * Schema v3 migration over a full storage dump. Folds legacy
+ * ytTitleLock:/ytThumbLock: keys, drops non-video ids (playlists, mixes),
+ * raw-frame thumbnails and "titles" shared by many videos (UI labels such as
+ * "Up next" that v2.4 captured), and fixes up record shapes.
+ * Returns the storage writes (changed records only) and removals to perform.
+ */
+function planMigration(all) {
+  const records = new Map();
+  const remove = [];
+
+  for (const k in all) {
     if (!k.startsWith(PIN_PREFIX)) continue;
-    const v = allObj[k];
-    const ts = v && typeof v === "object" && typeof v.ts === "number" ? v.ts : 0;
-    entries.push([k, ts]);
+    const ck = k.slice(PIN_PREFIX.length);
+    const rec = CACHE_KEY_RE.test(ck) ? sanitizeRecord(all[k]) : null;
+    if (!rec) remove.push(k);
+    else records.set(ck, rec);
   }
-  if (entries.length <= max) return [];
-  entries.sort((a, b) => a[1] - b[1]);
-  return entries.slice(0, entries.length - max).map((e) => e[0]);
-}
 
-function extractVideoId(href) {
-  try {
-    const u = new URL(href);
-    const host = u.hostname.replace(/^www\./, "");
-    if (host === "youtu.be") {
-      const m = u.pathname.slice(1).match(YT_ID_RE);
-      return m ? m[0] : null;
-    }
-    if (!host.endsWith("youtube.com")) return null;
-    if (u.pathname.startsWith("/shorts/")) {
-      const m = u.pathname.match(/\/shorts\/([a-zA-Z0-9_-]{11})/);
-      return m ? m[1] : null;
-    }
-    if (
-      u.pathname === "/watch" ||
-      u.pathname.startsWith("/watch/") ||
-      u.pathname === "/" ||
-      u.pathname === ""
-    ) {
-      const v = u.searchParams.get("v");
-      if (v && YT_ID_RE.test(v)) return v.match(YT_ID_RE)[0];
-    }
-    if (u.pathname.startsWith("/embed/")) {
-      const m = u.pathname.match(/\/embed\/([a-zA-Z0-9_-]{11})/);
-      return m ? m[1] : null;
-    }
-    const v2 = u.searchParams.get("v");
-    if (v2 && YT_ID_RE.test(v2)) return v2.match(YT_ID_RE)[0];
-  } catch {
-    return null;
+  for (const k in all) {
+    const isTitle = k.startsWith(LEGACY_TITLE_PREFIX);
+    const isThumb = k.startsWith(LEGACY_THUMB_PREFIX);
+    if (!isTitle && !isThumb) continue;
+    remove.push(k);
+    const id = k.slice((isTitle ? LEGACY_TITLE_PREFIX : LEGACY_THUMB_PREFIX).length);
+    if (!isVideoId(id)) continue;
+    const rec = records.get(id) || { t: null, th: null, tv: null, ts: 0 };
+    if (isTitle && !rec.t && isValidTitle(all[k])) rec.t = normalizeTitle(all[k]);
+    if (isThumb && !rec.th && isValidThumb(all[k]) && thumbFamily(all[k]) === "h") rec.th = all[k];
+    records.set(id, rec);
   }
-  return null;
-}
 
-function extractVideoIdFromYtNavigateDetail(detail) {
-  if (!detail || typeof detail !== "object") return null;
-  const pick = (x) => {
-    if (!x || typeof x !== "string") return null;
-    const m = x.match(YT_ID_RE);
-    return m ? m[0] : null;
-  };
-  const candidates = [
-    detail.endpoint?.watchEndpoint?.videoId,
-    detail.endpoint?.reelWatchEndpoint?.videoId,
-    detail.watchEndpoint?.videoId,
-    detail.reelWatchEndpoint?.videoId,
-    detail.response?.currentVideoEndpoint?.watchEndpoint?.videoId,
-    detail.response?.metadata?.videoDetails?.videoId,
-  ];
-  for (const c of candidates) {
-    const id = pick(c);
-    if (id) return id;
+  const titleUses = new Map();
+  for (const rec of records.values()) if (rec.t) titleUses.set(rec.t, (titleUses.get(rec.t) || 0) + 1);
+
+  const set = { [SCHEMA_KEY]: SCHEMA_VERSION };
+  for (const [ck, rec] of records) {
+    if (rec.t && titleUses.get(rec.t) >= SHARED_TITLE_LIMIT) rec.t = null;
+    const key = PIN_PREFIX + ck;
+    if (!rec.t && !rec.th && !rec.tv) remove.push(key);
+    else if (!all[key] || !sameRecord(rec, all[key])) set[key] = rec;
   }
-  return null;
+  return { set, remove };
 }
 
 /* ------------------------------------------------------------------ *
- * Storage layer.
+ * Runtime.
  * ------------------------------------------------------------------ */
 
-async function loadPinCache() {
-  try {
-    const all = await browser.storage.local.get(null);
-    enabled = all[ENABLED_KEY] !== false; // absent / true = enabled
-    for (const k of Object.keys(all)) {
-      if (!k.startsWith(PIN_PREFIX)) continue;
-      const rec = all[k];
-      if (rec && typeof rec === "object" && (rec.t || rec.th)) {
-        pinCache.set(k.slice(PIN_PREFIX.length), rec);
-      }
-    }
-  } catch {
-    /* ignore */
-  }
-}
+function bootContent() {
+  const api = globalThis.browser ?? globalThis.chrome;
+  const cache = new Map();
+  const dirty = new Set();
+  /** cache key → thumbnail fields forgotten since the last flush. */
+  const forgotten = new Map();
+  let ready = false;
+  let enabled = true;
+  let commitTimer = null;
 
-function scheduleCommit() {
-  if (commitTimer) return;
-  commitTimer = setTimeout(() => {
-    commitTimer = null;
-    void flushCommit();
-  }, COMMIT_DEBOUNCE_MS);
-}
-
-async function flushCommit() {
-  if (pendingWrites.size === 0) return;
-  const writes = {};
-  for (const [id, rec] of pendingWrites) writes[pinKey(id)] = rec;
-  pendingWrites.clear();
-
-  try {
-    await browser.storage.local.set(writes);
-  } catch {
-    return;
+  function emitState() {
+    document.dispatchEvent(new CustomEvent(EVT_STATE, { detail: JSON.stringify({ ready, enabled }) }));
   }
 
-  learnedSincePruneCheck += Object.keys(writes).length;
-  if (learnedSincePruneCheck >= PRUNE_CHECK_EVERY) {
-    learnedSincePruneCheck = 0;
+  document.addEventListener(EVT_QUERY, (e) => {
+    let req = null;
     try {
-      const all = await browser.storage.local.get(null);
-      const toRemove = selectKeysToEvict(all, PIN_MAX);
-      if (toRemove.length) await browser.storage.local.remove(toRemove);
+      req = JSON.parse(e.detail);
     } catch {
       /* ignore */
     }
+    const reply = { ready, enabled, pins: {} };
+    const ns = req?.ns === "m" ? "m" : "";
+    if (ready && enabled && Array.isArray(req?.items) && req.items.length <= MAX_QUERY_ITEMS) {
+      const { pins, dirty: changed } = resolveItems(cache, req.items, ns);
+      reply.pins = pins;
+      markDirty(changed);
+    }
+    if (ready && Array.isArray(req?.forget) && req.forget.length <= MAX_QUERY_ITEMS) {
+      const changed = forgetThumbs(cache, req.forget, ns);
+      for (const k of changed) {
+        const f = forgotten.get(k) || new Set();
+        for (const item of req.forget) if (cacheKey(ns, item?.id) === k) f.add(item.fam === "v" ? "tv" : "th");
+        forgotten.set(k, f);
+      }
+      markDirty(changed);
+    }
+    document.dispatchEvent(new CustomEvent(EVT_ANSWER, { detail: JSON.stringify(reply) }));
+  });
+
+  function markDirty(keys) {
+    if (!keys.length) return;
+    for (const k of keys) dirty.add(k);
+    scheduleCommit();
   }
-}
 
-async function migrateLegacyIfNeeded() {
-  try {
-    const flag = await browser.storage.local.get(SCHEMA_KEY);
-    if (flag[SCHEMA_KEY] >= SCHEMA_VERSION) return;
+  function scheduleCommit() {
+    if (commitTimer) return;
+    commitTimer = setTimeout(() => {
+      commitTimer = null;
+      void flush();
+    }, COMMIT_DEBOUNCE_MS);
+  }
 
-    const all = await browser.storage.local.get(null);
+  async function flush() {
+    if (!dirty.size) return;
+    const keys = [...dirty];
+    dirty.clear();
+    let stored = {};
+    try {
+      stored = await api.storage.local.get(keys.map((k) => PIN_PREFIX + k));
+    } catch {
+      /* extension context gone; keep the in-memory values */
+    }
     const writes = {};
-    const removes = [];
-    const now = Date.now();
-    const ensure = (id) =>
-      (writes[pinKey(id)] ||= { t: null, th: null, ts: now });
+    for (const k of keys) {
+      const mine = cache.get(k);
+      if (!mine) continue;
+      const merged = mergeStored(stored[PIN_PREFIX + k], mine, forgotten.get(k));
+      forgotten.delete(k);
+      cache.set(k, merged);
+      writes[PIN_PREFIX + k] = merged;
+    }
+    try {
+      await api.storage.local.set(writes);
+    } catch {
+      /* ignore */
+    }
+    prune();
+  }
 
+  function prune() {
+    if (cache.size <= PIN_MAX + PRUNE_SLACK) return;
+    const evict = selectKeysToEvict(cache, PIN_MAX);
+    for (const k of evict) {
+      cache.delete(k);
+      dirty.delete(k);
+    }
+    api.storage.local.remove(evict.map((k) => PIN_PREFIX + k)).catch(() => {});
+  }
+
+  api.storage.onChanged.addListener((changes, area) => {
+    if (area !== "local") return;
+    for (const k in changes) {
+      if (k === ENABLED_KEY) {
+        enabled = changes[k].newValue !== false;
+        emitState();
+      } else if (k.startsWith(PIN_PREFIX)) {
+        const v = changes[k].newValue;
+        const ck = k.slice(PIN_PREFIX.length);
+        // Keep values learned here that are still waiting to be written.
+        if (v && typeof v === "object") cache.set(ck, dirty.has(ck) && cache.has(ck) ? mergeStored(v, cache.get(ck)) : v);
+        else cache.delete(ck);
+      }
+    }
+  });
+
+  // Best effort: persist what was learned before the tab goes away.
+  window.addEventListener("pagehide", () => void flush());
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") void flush();
+  });
+
+  (async () => {
+    emitState();
+    let all = {};
+    try {
+      all = await api.storage.local.get(null);
+      if ((Number(all[SCHEMA_KEY]) || 0) < SCHEMA_VERSION) {
+        const plan = planMigration(all);
+        await api.storage.local.set(plan.set);
+        if (plan.remove.length) await api.storage.local.remove(plan.remove);
+        for (const k of plan.remove) delete all[k];
+        Object.assign(all, plan.set);
+      }
+    } catch {
+      /* start with whatever was read */
+    }
+    enabled = all[ENABLED_KEY] !== false;
     for (const k in all) {
-      if (k.startsWith(LEGACY_TITLE_PREFIX)) {
-        const id = k.slice(LEGACY_TITLE_PREFIX.length);
-        if (isValidTitle(all[k])) ensure(id).t = normalizeTitle(String(all[k]));
-        else ensure(id);
-        removes.push(k);
-      } else if (k.startsWith(LEGACY_THUMB_PREFIX)) {
-        const id = k.slice(LEGACY_THUMB_PREFIX.length);
-        if (isValidThumb(all[k])) ensure(id).th = all[k];
-        else ensure(id);
-        removes.push(k);
+      if (k.startsWith(PIN_PREFIX) && all[k] && typeof all[k] === "object") {
+        cache.set(k.slice(PIN_PREFIX.length), all[k]);
       }
     }
+    ready = true;
+    emitState();
+    prune();
+  })();
+}
 
-    if (Object.keys(writes).length) {
-      for (const key in writes) {
-        const ex = all[key];
-        if (ex && typeof ex === "object") {
-          if (!writes[key].t && typeof ex.t === "string") writes[key].t = ex.t;
-          if (!writes[key].th && typeof ex.th === "string") writes[key].th = ex.th;
-        }
-      }
-      await browser.storage.local.set(writes);
-    }
-    if (removes.length) await browser.storage.local.remove(removes);
-    await browser.storage.local.set({ [SCHEMA_KEY]: SCHEMA_VERSION });
-  } catch {
-    /* ignore; retried on next load */
+if (typeof window === "undefined") {
+  if (typeof module === "object" && module.exports) {
+    module.exports = {
+      PIN_PREFIX, PIN_MAX, SCHEMA_KEY, SCHEMA_VERSION, TOUCH_AFTER_MS,
+      isVideoId, normalizeTitle, isValidTitle, isValidThumb, thumbFamily, cacheKey,
+      mergeRecord, resolveItems, forgetThumbs, mergeStored, selectKeysToEvict, sanitizeRecord, planMigration,
+    };
   }
-}
-
-/* ------------------------------------------------------------------ *
- * MAIN-world bridge (this world is the cache authority).
- * ------------------------------------------------------------------ */
-
-function sendToMain(type, payload) {
-  window.postMessage({ source: CONTENT_BRIDGE_SOURCE, type, payload }, "*");
-}
-
-function sendFullCache() {
-  const entries = [];
-  for (const [id, rec] of pinCache) {
-    if (rec && (rec.t || rec.th)) entries.push([id, { t: rec.t || null, th: rec.th || null }]);
-  }
-  sendToMain("SET_CACHE", { enabled, entries });
-}
-
-function sendPatch(records, enabledChanged) {
-  const payload = { records };
-  if (enabledChanged) payload.enabled = enabled;
-  sendToMain("PATCH_CACHE", payload);
-}
-
-/** Absorb first-seen values discovered by the MAIN-world interception. */
-function handleLearn(payload) {
-  if (!enabled) return;
-  const entries = Array.isArray(payload?.entries) ? payload.entries : [];
-  let changed = false;
-  for (const e of entries) {
-    if (!e || !isValidId(e.id)) continue;
-    if (!isValidTitle(e.t) && !isValidThumb(e.th)) continue;
-    const prev = pinCache.get(e.id) || null;
-    const merged = learnMerge(prev, { t: e.t, th: e.th });
-    if (!prev || prev.t !== merged.t || prev.th !== merged.th) {
-      pinCache.set(e.id, merged);
-      pendingWrites.set(e.id, merged);
-      changed = true;
-    }
-  }
-  // MAIN already updated its mirror optimistically; the debounced commit's
-  // storage.onChanged will push the canonical record back to MAIN.
-  if (changed) scheduleCommit();
-}
-
-function installMainBridge() {
-  window.addEventListener("message", (event) => {
-    if (event.source !== window) return;
-    const msg = event.data;
-    if (!msg || msg.source !== PAGE_BRIDGE_SOURCE) return;
-
-    if (msg.type === "HELLO") {
-      if (cacheReady) sendFullCache();
-      return;
-    }
-    if (msg.type === "LEARN") {
-      void migrationReady.then(() => handleLearn(msg.payload));
-      return;
-    }
-  });
-}
-
-/* ------------------------------------------------------------------ *
- * DOM read/write primitives (Trusted-Types-safe: text nodes / img.src only).
- * ------------------------------------------------------------------ */
-
-const GRID_CARD_TAGS = new Set([
-  "YTD-RICH-ITEM-RENDERER", "YTD-VIDEO-RENDERER",
-  "YTD-GRID-VIDEO-RENDERER", "YTD-COMPACT-VIDEO-RENDERER",
-  "YTD-RICH-GRID-MEDIA", "YTD-REEL-ITEM-RENDERER",
-  "YTD-MOVIE-RENDERER", "YTD-PLAYLIST-VIDEO-RENDERER",
-  "YTD-CHANNEL-VIDEO-RENDERER", "YTD-PLAYLIST-PANEL-VIDEO-RENDERER",
-]);
-
-const GRID_LINK_SEL = 'a[href*="watch?v="], a[href*="/shorts/"]';
-const THUMB_IMG_SEL = 'img[src*="ytimg.com"]';
-
-function cssEsc(id) {
-  return typeof CSS !== "undefined" && typeof CSS.escape === "function"
-    ? CSS.escape(id)
-    : id.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-}
-
-function getPinTextTarget(el) {
-  if (!el) return null;
-  if (el.nodeName === "YT-FORMATTED-STRING") return el;
-  const direct = el.querySelector(":scope > yt-formatted-string");
-  if (direct) return direct;
-  const inner = el.querySelector("yt-formatted-string");
-  return inner || el;
-}
-
-const PIN_TEXT_SKIP_SEL = "script, style, textarea, noscript";
-
-function collectMeaningfulTextNodes(root, maxNodes) {
-  const out = [];
-  function walk(node) {
-    if (out.length >= maxNodes) return;
-    if (node.nodeType === Node.TEXT_NODE) {
-      if (normalizeTitle(node.nodeValue)) out.push(node);
-      return;
-    }
-    if (node.nodeType !== Node.ELEMENT_NODE) return;
-    const el = /** @type {Element} */ (node);
-    if (typeof el.matches === "function" && el.matches(PIN_TEXT_SKIP_SEL)) return;
-    for (const c of el.childNodes) {
-      walk(c);
-      if (out.length >= maxNodes) return;
-    }
-    const sr = el.shadowRoot;
-    if (sr) {
-      for (const c of sr.childNodes) {
-        walk(c);
-        if (out.length >= maxNodes) return;
-      }
-    }
-  }
-  walk(root);
-  return out;
-}
-
-function currentTitleText(el) {
-  const target = getPinTextTarget(el);
-  return target ? normalizeTitle(target.textContent) : "";
-}
-
-function setPinnedTitleText(host, pin) {
-  const target = getPinTextTarget(host);
-  if (!target) return;
-  const lock = normalizeTitle(pin);
-  if (normalizeTitle(target.textContent) === lock) return;
-
-  const nodes = collectMeaningfulTextNodes(target, 48);
-  if (nodes.length > 0) {
-    nodes[0].nodeValue = lock;
-    for (let i = 1; i < nodes.length; i++) nodes[i].nodeValue = "";
-    return;
-  }
-  if (target.childNodes.length === 0) {
-    target.appendChild(target.ownerDocument.createTextNode(lock));
-    return;
-  }
-  target.textContent = lock;
-}
-
-/**
- * Compute the URL to write into a thumbnail <img> so it shows the pinned A/B
- * variant while keeping the slot's own resolution. Returns null if no change.
- */
-function thumbUrlToApply(currentUrl, pinnedTh) {
-  const pv = parseThumb(pinnedTh);
-  if (!pv) return null;
-  const pe = parseThumb(currentUrl);
-  if (!pe) return pinnedTh;
-  if (pe.variant === pv.variant) return null; // already the pinned variant
-  return pv.variant === "" ? buildBaseThumb(pe.id, pe.res, pe.webp) : pinnedTh;
-}
-
-const thumbFallbackBound = new WeakSet();
-
-/** If a pinned (possibly expired custom) thumbnail fails, revert to native. */
-function bindThumbFallback(img) {
-  if (thumbFallbackBound.has(img)) return;
-  thumbFallbackBound.add(img);
-  img.addEventListener("error", function onErr() {
-    const native = img.getAttribute("data-ytpin-native");
-    if (!native || img.getAttribute("data-ytpin-reverted")) return;
-    img.setAttribute("data-ytpin-reverted", "1");
-    if (img.src !== native) img.src = native;
-  });
-}
-
-function setPinnedThumbnail(container, pinnedTh) {
-  if (!container || !isValidThumb(pinnedTh)) return;
-  // Only ever touch a real ytimg <img>; never stamp onto avatars/placeholders.
-  const img = container.querySelector(THUMB_IMG_SEL);
-  if (!img) return;
-  const cur = img.getAttribute("src") || img.src || "";
-  const next = thumbUrlToApply(cur, pinnedTh);
-  if (!next || img.src === next) return;
-  // We only reach here when `cur` is a non-pinned (native/other) URL, so it is
-  // exactly the value to fall back to. Refresh it every time so a recycled <img>
-  // never reverts to a previous video's thumbnail.
-  if (cur) {
-    img.setAttribute("data-ytpin-native", cur);
-    img.removeAttribute("data-ytpin-reverted");
-    bindThumbFallback(img);
-  }
-  img.src = next;
-}
-
-/* ------------------------------------------------------------------ *
- * DOM reconciler (apply-only safety net; never learns).
- * ------------------------------------------------------------------ */
-
-function closestGridCard(el) {
-  let n = el;
-  while (n && n !== document.body) {
-    if (GRID_CARD_TAGS.has(n.nodeName)) return n;
-    n = n.parentElement;
-  }
-  return null;
-}
-
-function getGridTitleElement(card, link) {
-  const byId = card.querySelector("#video-title");
-  if (byId) return byId;
-  const inner = link.querySelector("yt-formatted-string");
-  if (inner) return inner;
-  if (link.querySelector("ytd-thumbnail, img")) return null;
-  return link;
-}
-
-/** The video id a card currently resolves to (used as a recycling guard). */
-function cardVideoId(card) {
-  const a = card.querySelector(GRID_LINK_SEL);
-  const href = a?.getAttribute("href");
-  if (!href) return null;
-  try {
-    return extractVideoId(new URL(href, location.origin).href);
-  } catch {
-    return null;
-  }
-}
-
-function applyToCard(card, link, id, rec, applyTitles) {
-  const href = link.getAttribute("href") || "";
-  const isShort =
-    href.startsWith("/shorts/") ||
-    card.nodeName === "YTD-REEL-ITEM-RENDERER" ||
-    !!card.closest("ytd-shorts");
-
-  if (applyTitles && isValidTitle(rec.t)) {
-    const titleEl = getGridTitleElement(card, link);
-    if (titleEl && currentTitleText(titleEl) !== normalizeTitle(rec.t)) {
-      setPinnedTitleText(titleEl, rec.t);
-    }
-  }
-  // Never cross-apply a (horizontal) video thumbnail onto a Shorts slot.
-  if (!isShort && isValidThumb(rec.th)) {
-    setPinnedThumbnail(card.querySelector("ytd-thumbnail") || card, rec.th);
-  }
-}
-
-async function reconcileDom() {
-  await migrationReady;
-  if (!enabled) return;
-
-  // A title-untranslator intentionally owns the visible text. Re-applying our
-  // stored title would create an endless MutationObserver ping-pong; thumbnail
-  // pins remain independent and are still reconciled below.
-  const applyTitles = !hasExternalTitleOwner(document);
-
-  const roots = [
-    "#contents", "ytd-miniplayer", "ytd-shorts",
-    "#secondary", "#primary-inner", "#primary",
-  ];
-  const seen = new Set();
-  let applied = 0;
-  let examined = 0;
-
-  for (const sel of roots) {
-    for (const root of document.querySelectorAll(sel)) {
-      if (!root.isConnected) continue;
-      for (const a of root.querySelectorAll(GRID_LINK_SEL)) {
-        if (applied >= DOM_SCAN_CAP || examined >= DOM_LINK_CAP) return;
-        examined++;
-        if (a.closest("ytd-watch-metadata")) continue;
-        const href = a.getAttribute("href");
-        if (!href) continue;
-        let id;
-        try {
-          id = extractVideoId(new URL(href, location.origin).href);
-        } catch {
-          continue;
-        }
-        if (!id) continue;
-        const card = closestGridCard(a);
-        if (!card || seen.has(card)) continue;
-        seen.add(card);
-        const rec = pinCache.get(id);
-        if (!rec) continue;
-        // Recycling guard: the card must still resolve to this id.
-        if (cardVideoId(card) !== id) continue;
-        applyToCard(card, a, id, rec, applyTitles);
-        applied++;
-      }
-    }
-  }
-}
-
-/**
- * Trailing-edge throttle (not a resetting debounce): once a pass is pending it
- * is not pushed back by further mutations, so continuous churn (comments, live
- * chat) can never starve the reconciler.
- */
-function scheduleReconcile() {
-  if (reconcileTimer) return;
-  reconcileTimer = setTimeout(() => {
-    reconcileTimer = null;
-    void reconcileDom();
-  }, RECONCILE_DEBOUNCE_MS);
-}
-
-/* ------------------------------------------------------------------ *
- * Watch / Shorts title reconciler.
- * ------------------------------------------------------------------ */
-
-async function applyWatchTitle() {
-  await migrationReady;
-  if (!enabled) return;
-  if (hasExternalTitleOwner(document)) return;
-
-  const onShorts = location.pathname.startsWith("/shorts/");
-  let videoId;
-  if (onShorts) {
-    const m = location.pathname.match(/\/shorts\/([a-zA-Z0-9_-]{11})/);
-    videoId = m ? m[1] : null;
-  } else {
-    videoId = extractVideoId(location.href);
-  }
-  if (!videoId) return;
-
-  const rec = pinCache.get(videoId);
-  if (!rec || !isValidTitle(rec.t)) return;
-
-  const pinned = normalizeTitle(rec.t);
-
-  if (onShorts) {
-    const scope =
-      document.querySelector("ytd-shorts") ||
-      document.querySelector("#shorts-container") ||
-      document.body;
-    for (const sel of ["h1.ytd-watch-metadata", "h2.ytd-shorts-title", "#title h1"]) {
-      const el = scope.querySelector(sel);
-      if (el && currentTitleText(el) !== pinned) {
-        setPinnedTitleText(el, pinned);
-        break;
-      }
-    }
-  } else {
-    const scope =
-      document.querySelector("#primary-inner") || document.querySelector("#primary");
-    if (scope) {
-      const metas = scope.querySelectorAll(
-        `ytd-watch-metadata[video-id="${cssEsc(videoId)}"]`
-      );
-      const meta = metas.length ? metas[metas.length - 1] : null;
-      const host = meta || scope;
-      for (const sel of ["h1.ytd-watch-metadata", "#title h1", "h1"]) {
-        const el = host.querySelector(sel);
-        if (el && currentTitleText(el) !== pinned) {
-          setPinnedTitleText(el, pinned);
-          break;
-        }
-      }
-    }
-  }
-}
-
-function applyAll() {
-  scheduleReconcile();
-  void applyWatchTitle();
-}
-
-/* ------------------------------------------------------------------ *
- * Scoped, debounced subtree observers (safety net for scroll/lazy surfaces).
- * `#secondary` is intentionally excluded (it mutates constantly); it is still
- * scanned on nav/data triggers via reconcileDom's root list.
- * ------------------------------------------------------------------ */
-
-let subtreeObserver = null;
-
-function attachObservers() {
-  if (typeof MutationObserver === "undefined") return;
-  if (!subtreeObserver) {
-    subtreeObserver = new MutationObserver(() => scheduleReconcile());
-  } else {
-    subtreeObserver.disconnect();
-  }
-  // Observe only the infinite-scroll grid feeds. Comments / live chat / player
-  // (under #primary-inner) churn constantly and are covered by the interception
-  // layer and event-driven reconciles instead.
-  for (const sel of ["#contents", "ytd-shorts"]) {
-    for (const el of document.querySelectorAll(sel)) {
-      if (el.isConnected) {
-        subtreeObserver.observe(el, { childList: true, subtree: true });
-      }
-    }
-  }
-}
-
-function scheduleResync() {
-  if (resyncTimer) clearTimeout(resyncTimer);
-  resyncTimer = setTimeout(() => {
-    resyncTimer = null;
-    attachObservers();
-  }, RESYNC_DEBOUNCE_MS);
-}
-
-/* ------------------------------------------------------------------ *
- * Bootstrap.
- * ------------------------------------------------------------------ */
-
-if (typeof document !== "undefined" && typeof browser !== "undefined") {
-  installMainBridge();
-
-  migrationReady = migrateLegacyIfNeeded().then(async () => {
-    await loadPinCache();
-    cacheReady = true;
-    sendFullCache(); // push snapshot to MAIN (covers a HELLO we already got)
-    attachObservers();
-    applyAll();
-  });
-
-  // Cross-tab / own-commit sync: update the cache and mirror deltas to MAIN.
-  if (browser.storage?.onChanged) {
-    browser.storage.onChanged.addListener((changes, area) => {
-      if (area !== "local") return;
-      let enabledChanged = false;
-      if (Object.prototype.hasOwnProperty.call(changes, ENABLED_KEY)) {
-        enabled = changes[ENABLED_KEY].newValue !== false;
-        enabledChanged = true;
-      }
-      const records = [];
-      for (const k of Object.keys(changes)) {
-        if (!k.startsWith(PIN_PREFIX)) continue;
-        const id = k.slice(PIN_PREFIX.length);
-        const nv = changes[k].newValue;
-        if (nv && typeof nv === "object" && (nv.t || nv.th)) {
-          pinCache.set(id, nv);
-          records.push([id, { t: nv.t || null, th: nv.th || null }]);
-        } else {
-          pinCache.delete(id);
-          records.push([id, null]);
-        }
-      }
-      if (records.length || enabledChanged) sendPatch(records, enabledChanged);
-      if (enabledChanged && enabled) applyAll();
-    });
-  }
-
-  // React to YouTube's own navigation events + webNavigation SPA signal.
-  browser.runtime.onMessage.addListener((msg) => {
-    if (msg && msg.type === "ytTitleLockHistoryState") {
-      applyAll();
-      scheduleResync();
-    }
-  });
-
-  for (const evt of ["yt-navigate-finish", "yt-page-data-updated"]) {
-    document.addEventListener(
-      evt,
-      () => {
-        applyAll();
-        scheduleResync();
-      },
-      true
-    );
-  }
-
-  window.addEventListener("popstate", () => applyAll());
-
-  requestAnimationFrame(() => {
-    requestAnimationFrame(() => {
-      void migrationReady.then(applyAll);
-    });
-  });
-}
-
-/* ------------------------------------------------------------------ *
- * Unit-test exports.
- * ------------------------------------------------------------------ */
-if (typeof module !== "undefined" && module.exports) {
-  module.exports = {
-    normalizeTitle,
-    looksLikeTimestampOrDuration,
-    isValidTitle,
-    isValidThumb,
-    isValidId,
-    hasExternalTitleOwner,
-    extractVideoId,
-    extractVideoIdFromYtNavigateDetail,
-    mergeRecord,
-    learnMerge,
-    parseThumb,
-    buildBaseThumb,
-    thumbUrlToApply,
-    selectKeysToEvict,
-    PIN_PREFIX,
-    PIN_MAX,
-    TENTATIVE_SETTLE_MS,
-  };
+} else {
+  bootContent();
 }

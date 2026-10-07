@@ -6,7 +6,7 @@
  * string on return visits and avoid drift on the same page — not that YouTube served two
  * variants in this run.
  */
-const { test, expect } = require("@playwright/test");
+const { test, expect } = require("./support/fixtures.cjs");
 
 const WATCH_H1 = "#primary h1.ytd-watch-metadata";
 

@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "E2E stand-in for a third-party YouTube extension",
+  "version": "1.0",
+  "host_permissions": ["*://*.youtube.com/*"],
+  "content_scripts": [
+    {
+      "matches": ["*://*.youtube.com/*"],
+      "js": ["inject.js"],
+      "run_at": "document_start"
+    }
+  ],
+  "web_accessible_resources": [{ "resources": ["page.js"], "matches": ["*://*.youtube.com/*"] }],
+  "browser_specific_settings": { "gecko": { "id": "other-extension@ytpin.e2e" } }
+}

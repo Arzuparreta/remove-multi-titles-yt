@@ -1,54 +1,27 @@
-/* eslint-disable @typescript-eslint/no-require-imports */
-const { defineConfig, devices } = require("@playwright/test");
-const path = require("path");
+const { defineConfig } = require("@playwright/test");
 
-/** Chrome MV3 bundle (manifest uses service_worker; repo root manifest is Firefox). */
-const extensionPath = path.resolve(__dirname, "dist", "chrome-unpacked");
-
-const chromeDesktop = {
-  ...devices["Desktop Chrome"],
-  channel: "chromium",
-  headless: false,
-};
-
+/**
+ * Extensions are loaded through a persistent context (see tests/support/fixtures.cjs),
+ * in Chromium's new headless mode — no Xvfb needed. Set HEADED=1 to watch.
+ * Build the Chrome bundle first: `npm run build:chrome-unpacked`.
+ */
 module.exports = defineConfig({
   testDir: "tests",
+  testMatch: "**/*.spec.js",
   fullyParallel: false,
   workers: 1,
   timeout: 120_000,
   expect: { timeout: 45_000 },
   reporter: [["list"], ["html", { open: "never" }]],
-  use: {
-    ...chromeDesktop,
-  },
   projects: [
     {
       name: "with-extension",
-      testMatch: [
-        "**/multi-title-pin.spec.js",
-        "**/sidebar-thumb-nav-debug.spec.js",
-        "**/search-recycle.spec.js",
-      ],
-      use: {
-        ...chromeDesktop,
-        launchOptions: {
-          ignoreDefaultArgs: ["--disable-extensions"],
-          args: [
-            `--disable-extensions-except=${extensionPath}`,
-            `--load-extension=${extensionPath}`,
-          ],
-        },
-      },
+      use: { withExtension: true },
     },
     {
       name: "no-extension",
-      testMatch: "**/sidebar-thumb-nav-debug.spec.js",
-      use: {
-        ...chromeDesktop,
-        launchOptions: {
-          args: [],
-        },
-      },
+      testMatch: "**/nav-integrity.spec.js",
+      use: { withExtension: false },
     },
   ],
 });
