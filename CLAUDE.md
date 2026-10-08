@@ -52,9 +52,9 @@ Bridge events: `ytpin:q` (MAIN→ISOLATED, JSON string), `ytpin:a` (answer), `yt
 - When YouTube changes its JSON: `npm run capture:fixtures`, then fix `HANDLERS` until `npm run test:unit` passes.
 - Pure helpers are exported under `typeof window === "undefined"` guards for `node:test`.
 
-## Releases (the agent does this end to end)
+## Releases
 
-When the user asks for "the dist", a build, a release or a new version, do the whole flow without asking. The user never builds locally.
+The distributables are the assets of a GitHub Release built by CI:
 
 1. Bump `version` in `manifest.json` (patch for fixes, minor for features, major for redesigns), unless the user gave one. Chrome only accepts dotted numbers, so no `-beta` suffixes.
 2. `npm run test:unit` and `npm run lint:ext` must pass.
@@ -64,7 +64,7 @@ When the user asks for "the dist", a build, a release or a new version, do the w
 6. Write the release notes in English above the generated PR list (`gh release edit vX.Y.Z --notes-file …`): a `## vX.Y.Z — <headline>` title, **Fixed** / **Changed** bullets in user terms, and an **Assets** list naming both ZIPs. See v3.0.0.
 7. Reply with the release URL.
 
-Pushes to `main` and PRs also build both ZIPs as the run artifact `extension-zips`, for testing a commit without a release. Build locally (`npm run build:amo` → `dist-amo/`, `npm run build:chrome-zip` → `dist/remove-multi-titles-yt-chrome-<version>.zip`) only when the user asks for local files.
+Pushes to `main` and PRs also build both ZIPs as the run artifact `extension-zips`, for testing a commit without a release. Local builds: `npm run build:amo` → `dist-amo/`, `npm run build:chrome-zip` → `dist/remove-multi-titles-yt-chrome-<version>.zip`.
 
 ## Store Submission
 
