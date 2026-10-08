@@ -2,7 +2,19 @@
 
 Use this when you are ready to publish. The repo includes **`icons/*.png`** (16–512) plus **`action.default_icon`** in `manifest.json`. Regenerate from the source JPEG with **`npm run build:icons`**.
 
-## Build the ZIP (do not hand-zip the repo)
+## Release (GitHub Actions builds the ZIPs)
+
+Bump `version` in `manifest.json`, commit, then push a matching tag:
+
+```bash
+git tag v3.0.1 && git push origin v3.0.1
+```
+
+The **Build** workflow (`.github/workflows/build.yml`) runs the unit tests and `web-ext lint`, builds both ZIPs from a clean checkout and publishes a GitHub Release with them attached (Firefox AMO ZIP + Chrome Web Store ZIP, release notes generated from the merged PRs). It refuses tags that do not match the manifest version. Every push to `main` and every PR also builds the ZIPs and keeps them under the run's **Artifacts** (`extension-zips`).
+
+Download the assets from the release and upload them to each store.
+
+## Build the ZIP locally (do not hand-zip the repo)
 
 **Firefox (AMO)** uses the root `manifest.json`. The repo includes **`web-ext-config.mjs`** so the AMO package is reproducible. **`dist-amo/` is gitignored**.
 
@@ -12,15 +24,15 @@ npm ci
 npm run build:amo
 ```
 
-Upload the ZIP under **`dist-amo/`** to AMO. Alternatively, run the **Build AMO package** workflow on GitHub Actions and download the **`firefox-amo-zip`** artifact.
+Upload the ZIP under **`dist-amo/`** to AMO. A local build includes any untracked file in the repo that `web-ext-config.mjs` does not ignore; the CI build does not.
 
-**Chrome Web Store**: run **`npm run build:chrome-zip`** and upload `dist/remove-multi-titles-yt-chrome.zip`. It contains the same files; its manifest only drops the Firefox-only `browser_specific_settings` key.
+**Chrome Web Store**: run **`npm run build:chrome-zip`** and upload `dist/remove-multi-titles-yt-chrome-<version>.zip`. It contains the same files; its manifest only drops the Firefox-only `browser_specific_settings` key.
 
 Checklist:
 
 - [x] Icon PNGs under `icons/` and `icons` / `action` keys in `manifest.json` (see `npm run build:icons`).
 - [ ] Bump `version` in `manifest.json` when you ship an update.
-- [ ] Run `npm run build:amo` (or the GitHub Action)—do not zip the whole project folder; that would include junk and can fail validation.
+- [ ] Push the `v<version>` tag (or run `npm run build:amo` locally)—do not zip the whole project folder; that would include junk and can fail validation.
 
 ## Public privacy policy URL
 
