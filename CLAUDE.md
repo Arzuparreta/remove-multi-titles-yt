@@ -52,10 +52,22 @@ Bridge events: `ytpin:q` (MAIN→ISOLATED, JSON string), `ytpin:a` (answer), `yt
 - When YouTube changes its JSON: `npm run capture:fixtures`, then fix `HANDLERS` until `npm run test:unit` passes.
 - Pure helpers are exported under `typeof window === "undefined"` guards for `node:test`.
 
+## Releases (the agent does this end to end)
+
+When the user asks for "the dist", a build, a release or a new version, do the whole flow without asking. The user never builds locally.
+
+1. Bump `version` in `manifest.json` (patch for fixes, minor for features, major for redesigns), unless the user gave one. Chrome only accepts dotted numbers, so no `-beta` suffixes.
+2. `npm run test:unit` and `npm run lint:ext` must pass.
+3. Commit the bump with the work it ships and push it to the work branch / PR.
+4. Tag that commit and push the tag: `git tag -a vX.Y.Z -m vX.Y.Z && git push origin vX.Y.Z`. PRs are merged with merge commits, so a tag on a PR's head stays in `main`'s history.
+5. The tag triggers `.github/workflows/build.yml`: it checks the tag matches the manifest version, runs the unit tests and lint, builds both ZIPs from a clean checkout and publishes a GitHub Release with them attached (`Firefox (AMO) - vX.Y.Z`, `Chrome (Web Store) - vX.Y.Z`). Wait for it (`gh run watch <id> --exit-status`) and check the release has both assets.
+6. Write the release notes in English above the generated PR list (`gh release edit vX.Y.Z --notes-file …`): a `## vX.Y.Z — <headline>` title, **Fixed** / **Changed** bullets in user terms, and an **Assets** list naming both ZIPs. See v3.0.0.
+7. Reply with the release URL.
+
+Pushes to `main` and PRs also build both ZIPs as the run artifact `extension-zips`, for testing a commit without a release. Build locally (`npm run build:amo` → `dist-amo/`, `npm run build:chrome-zip` → `dist/remove-multi-titles-yt-chrome-<version>.zip`) only when the user asks for local files.
+
 ## Store Submission
 
-- Bump `version` in `manifest.json`.
-- Push a `v<version>` tag: `.github/workflows/build.yml` tests, lints, builds both ZIPs and publishes a GitHub Release with them (the tag must match the manifest version). Pushes to `main` and PRs upload the ZIPs as run artifacts.
-- Local builds: Firefox `npm run build:amo` (ZIP in `dist-amo/`), Chrome `npm run build:chrome-zip` (`dist/remove-multi-titles-yt-chrome-<version>.zip`).
+- Upload the release's ZIPs: the Firefox one to AMO, the Chrome one to the Chrome Web Store.
 - Keep the Firefox add-on ID `{a7b3c9d2-4e1f-4a8b-9c0d-1e2f3a4b5c6d}`.
 - PRIVACY.md must stay publicly hosted for both stores.
