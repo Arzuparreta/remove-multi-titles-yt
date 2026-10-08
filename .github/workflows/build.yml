@@ -1,0 +1,72 @@
+# Every push / PR: unit tests, web-ext lint, Firefox + Chrome ZIPs (downloadable
+# from the run's Artifacts). A `v*` tag also publishes them as a GitHub Release.
+# Release flow: bump `version` in manifest.json, commit, `git tag vX.Y.Z && git push origin vX.Y.Z`.
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - name: Tag matches manifest version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version=$(node -p "require('./manifest.json').version")
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match manifest.json version $version"
+            exit 1
+          fi
+      # Skip the Playwright browser download (postinstall); E2E needs live YouTube.
+      - run: npm ci --ignore-scripts
+      - run: npm run test:unit
+      - run: npm run lint:ext
+      - run: npm run build:amo
+      - run: npm run build:chrome-zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: extension-zips
+          path: |
+            dist-amo/*.zip
+            dist/*.zip
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: extension-zips
+          path: zips
+      - name: Publish release
+        run: |
+          shopt -s failglob
+          firefox=(zips/dist-amo/*.zip)
+          chrome=(zips/dist/*.zip)
+          assets=("${firefox[0]}#Firefox (AMO) - $TAG" "${chrome[0]}#Chrome (Web Store) - $TAG")
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${assets[@]}" --clobber
+          else
+            gh release create "$TAG" "${assets[@]}" --title "$TAG" --generate-notes --verify-tag
+          fi

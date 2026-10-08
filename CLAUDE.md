@@ -55,6 +55,7 @@ Bridge events: `ytpin:q` (MAIN→ISOLATED, JSON string), `ytpin:a` (answer), `yt
 ## Store Submission
 
 - Bump `version` in `manifest.json`.
-- Firefox: `npm run build:amo` (ZIP in `dist-amo/`). Chrome: `npm run build:chrome-zip`.
+- Push a `v<version>` tag: `.github/workflows/build.yml` tests, lints, builds both ZIPs and publishes a GitHub Release with them (the tag must match the manifest version). Pushes to `main` and PRs upload the ZIPs as run artifacts.
+- Local builds: Firefox `npm run build:amo` (ZIP in `dist-amo/`), Chrome `npm run build:chrome-zip` (`dist/remove-multi-titles-yt-chrome-<version>.zip`).
 - Keep the Firefox add-on ID `{a7b3c9d2-4e1f-4a8b-9c0d-1e2f3a4b5c6d}`.
 - PRIVACY.md must stay publicly hosted for both stores.
